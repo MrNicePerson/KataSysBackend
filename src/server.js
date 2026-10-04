@@ -1,10 +1,12 @@
 import cors from 'cors'
 import express from 'express'
 import mongoose from 'mongoose'
+
 import { env } from './config/env.js'
 import { connectDatabase } from './config/db.js'
 import { authRequired } from './middleware/auth.js'
 import { errorHandler, notFound } from './middleware/errorHandler.js'
+
 import { authRouter } from './routes/auth.routes.js'
 import { adminRouter } from './routes/admin.routes.js'
 import { claimsRouter } from './routes/claims.routes.js'
@@ -20,85 +22,280 @@ import { salesRouter } from './routes/sales.routes.js'
 import { suppliersRouter } from './routes/suppliers.routes.js'
 import { workspaceRouter } from './routes/workspace.routes.js'
 
+
 const app = express()
 
 app.disable('x-powered-by')
 
-app.use(cors({ origin: env.corsOrigin }))
-app.use(express.json({ limit: '2mb' }))
 
-// Root route
+// =====================================================
+// CORS CONFIGURATION
+// =====================================================
+
+const allowedOrigins = env.corsOrigins
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+
+      // Allow requests without an Origin
+      // Example: Postman or server-to-server requests
+      if (!origin) {
+        return callback(null, true)
+      }
+
+      // Allow only configured origins
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true)
+      }
+
+      return callback(
+        new Error(`CORS: Origin ${origin} not allowed`)
+      )
+    },
+
+    credentials: true,
+  })
+)
+
+
+// =====================================================
+// BODY PARSER
+// =====================================================
+
+app.use(
+  express.json({
+    limit: '2mb',
+  })
+)
+
+
+// =====================================================
+// ROOT ROUTE
+// =====================================================
+
 app.get('/', (_req, res) => {
+
   res.status(200).json({
+
     message: 'KataSys API is running',
+
     status: 'success',
+
     database:
       mongoose.connection.readyState === 1
         ? 'connected'
         : 'disconnected',
+
   })
+
 })
 
-// Health check
+
+// =====================================================
+// HEALTH CHECK
+// =====================================================
+
 app.get('/api/health', (_req, res) => {
+
+  const connected =
+    mongoose.connection.readyState === 1
+
   res
-    .status(mongoose.connection.readyState === 1 ? 200 : 503)
+    .status(connected ? 200 : 503)
     .json({
+
       status:
-        mongoose.connection.readyState === 1
+        connected
           ? 'ok'
           : 'unavailable',
+
       database:
-        mongoose.connection.readyState === 1
+        connected
           ? 'connected'
           : 'disconnected',
+
     })
+
 })
 
-// Authentication routes
-app.use('/api/auth', authRouter)
 
-// Protected API routes
+// =====================================================
+// AUTHENTICATION ROUTES
+// =====================================================
+
+app.use(
+  '/api/auth',
+  authRouter
+)
+
+
+// =====================================================
+// PROTECTED API ROUTES
+// =====================================================
+
 const protectedApi = express.Router()
 
 protectedApi.use(authRequired)
 
-protectedApi.use('/workspace', workspaceRouter)
-protectedApi.use('/sales', salesRouter)
-protectedApi.use('/products', productsRouter)
-protectedApi.use('/purchases', purchasesRouter)
-protectedApi.use('/customers', customersRouter)
-protectedApi.use('/suppliers', suppliersRouter)
-protectedApi.use('/cheques', chequesRouter)
-protectedApi.use('/returns', returnsRouter)
-protectedApi.use('/orders', ordersRouter)
-protectedApi.use('/claims', claimsRouter)
-protectedApi.use('/finance', financeRouter)
-protectedApi.use('/reports', reportsRouter)
-protectedApi.use('/admin', adminRouter)
 
-app.use('/api', protectedApi)
-
-// 404 handler
-app.use(notFound)
-
-// Global error handler
-app.use(errorHandler)
-
-// Start database and server
-const server = await connectDatabase().then(() =>
-  app.listen(env.port, () => {
-    console.log(`KataSys API listening on port ${env.port}`)
-  })
+// Workspace
+protectedApi.use(
+  '/workspace',
+  workspaceRouter
 )
 
-// Graceful shutdown
-for (const signal of ['SIGINT', 'SIGTERM']) {
+
+// Sales
+protectedApi.use(
+  '/sales',
+  salesRouter
+)
+
+
+// Products
+protectedApi.use(
+  '/products',
+  productsRouter
+)
+
+
+// Purchases
+protectedApi.use(
+  '/purchases',
+  purchasesRouter
+)
+
+
+// Customers
+protectedApi.use(
+  '/customers',
+  customersRouter
+)
+
+
+// Suppliers
+protectedApi.use(
+  '/suppliers',
+  suppliersRouter
+)
+
+
+// Cheques
+protectedApi.use(
+  '/cheques',
+  chequesRouter
+)
+
+
+// Returns
+protectedApi.use(
+  '/returns',
+  returnsRouter
+)
+
+
+// Orders
+protectedApi.use(
+  '/orders',
+  ordersRouter
+)
+
+
+// Claims
+protectedApi.use(
+  '/claims',
+  claimsRouter
+)
+
+
+// Finance
+protectedApi.use(
+  '/finance',
+  financeRouter
+)
+
+
+// Reports
+protectedApi.use(
+  '/reports',
+  reportsRouter
+)
+
+
+// Admin
+protectedApi.use(
+  '/admin',
+  adminRouter
+)
+
+
+// Mount protected routes
+app.use(
+  '/api',
+  protectedApi
+)
+
+
+// =====================================================
+// 404 HANDLER
+// =====================================================
+
+app.use(notFound)
+
+
+// =====================================================
+// GLOBAL ERROR HANDLER
+// =====================================================
+
+app.use(errorHandler)
+
+
+// =====================================================
+// DATABASE + SERVER
+// =====================================================
+
+const server = await connectDatabase().then(() => {
+
+  return app.listen(
+    env.port,
+    () => {
+
+      console.log(
+        `KataSys API listening on port ${env.port}`
+      )
+
+      console.log(
+        'Allowed CORS origins:',
+        allowedOrigins
+      )
+
+    }
+  )
+
+})
+
+
+// =====================================================
+// GRACEFUL SHUTDOWN
+// =====================================================
+
+for (
+  const signal of ['SIGINT', 'SIGTERM']
+) {
+
   process.on(signal, () => {
+
     server.close(() => {
+
       mongoose
         .disconnect()
-        .finally(() => process.exit(0))
+        .finally(() => {
+          process.exit(0)
+        })
+
     })
+
   })
+
 }
