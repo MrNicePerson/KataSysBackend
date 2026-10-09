@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken'
 import { env } from '../config/env.js'
-import { User, publicUser } from '../models/User.js'
+import { hasPermission, User, publicUser } from '../models/User.js'
 
 export function signToken(user) {
   return jwt.sign({ sub: String(user._id), role: user.role }, env.jwtSecret, { expiresIn: env.jwtExpiresIn })
@@ -31,14 +31,31 @@ export async function authRequired(req, res, next) {
   }
 }
 
-export function requirePermission(permission) {
+export function requirePermission(permission, actionOverride = null) {
   return (req, res, next) => {
     if (!req.user) {
       const error = new Error('Sign in is required.')
       error.status = 401
       return next(error)
     }
-    if (req.user.role === 'admin' || req.user.permissions?.admin || req.user.permissions?.[permission]) return next()
+    const path = req.path || ''
+    let module = permission
+    let action = actionOverride || (req.method === 'GET' ? 'view' : req.method === 'POST' ? 'create' : req.method === 'DELETE' ? 'delete' : 'edit')
+    if (!actionOverride && req.method === 'PATCH' && path.endsWith('/status')) action = 'approve'
+    if (permission === 'stock' && String(req.baseUrl || '').endsWith('/purchases')) module = 'purchases'
+    if (permission === 'finance' && path.startsWith('/daily-closing')) {
+      module = 'dailyClosing'
+      if (req.method === 'GET') action = 'view'
+      else if (req.method === 'POST' && req.body?.type) {
+        const recordType = req.body.type === 'opening' ? 'Opening' : 'Closing'
+        const existing = req.database?.dailyClosings?.some((entry) => entry.date === req.body.date && entry.type === req.body.type)
+        action = `daily${recordType}${existing ? 'Edit' : 'Create'}`
+      } else if (req.method === 'DELETE') action = 'closingApprove'
+    } else if (permission === 'finance' && path.startsWith('/banks')) {
+      module = 'dailyClosing'
+      action = path.includes('/transactions') ? 'withdrawals' : 'bankBalances'
+    }
+    if (hasPermission(req.user, module, action)) return next()
     const error = new Error('You do not have permission for this action.')
     error.status = 403
     next(error)

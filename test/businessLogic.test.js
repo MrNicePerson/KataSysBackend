@@ -10,6 +10,7 @@ import {
   bankSummary,
   completeHeldOrder,
   receivePurchase,
+  recordStockCountAudit,
   processCustomerReturn,
   saveSettings,
   recordHeldOrder,
@@ -101,6 +102,7 @@ test('bank purchase validates details and amounts before changing stock or balan
 
 test('editing saved receipt fields leaves sale items, stock and balances unchanged', () => {
   const created = createSale(databaseFixture(), { customerId: 'customer-1', date: '2026-10-03', items: [{ productId: 'product-1', quantity: 2, price: 10 }], payments: { cash: 5 } })
+  assert.equal(created.record.customer, 'Customer One')
   const before = structuredClone(created.database)
   const updated = runDatabaseCommand(created.database, 'update-sale-receipt', {
     saleId: created.record.id, padInvoiceNumber: ' PAD-7 ', customerPhone: '0300 1234567', customerAddress: 'Lahore', paymentDue: '2026-10-10',
@@ -224,13 +226,23 @@ test('sale applies split payment, due date, account balance, and stock change', 
   const result = createSale(databaseFixture(), {
     customerId: 'customer-1',
     items: [{ productId: 'product-1', quantity: 2, price: 12 }],
-    payments: { cash: 8, bank: 5 },
+    payments: { cash: 8, bank: 5, cheque: 2 },
+    bankDetails: { bankName: 'Main Bank', accountNumber: '001' },
+    cheque: { chequeNumber: 'CH-9', bankName: 'Cheque Bank', chequeDate: '2026-10-04', dueDate: '2026-10-30' },
     paymentDue: '2026-10-30',
   })
 
   assert.equal(result.record.total, 24)
   assert.equal(result.record.due, 11)
   assert.equal(result.record.paymentDue, '2026-10-30')
+  assert.deepEqual(result.record.payments, { cash: 8, bank: 5, cheque: 2 })
+  assert.deepEqual(result.record.bankDetails, { bankName: 'Main Bank', accountNumber: '001', amount: 5 })
+  assert.deepEqual(result.database.payments.find((payment) => payment.method === 'bank').bankDetails, result.record.bankDetails)
+  assert.equal(result.database.cheques[0].amount, 2)
+  assert.equal(result.database.cheques[0].number, 'CH-9')
+  assert.equal(result.database.cheques[0].bank, 'Cheque Bank')
+  assert.equal(result.database.cheques[0].issued, '2026-10-04')
+  assert.equal(result.database.cheques[0].expectedClearanceDate, '2026-10-30')
   assert.equal(result.database.customers[0].balance, 11)
   assert.equal(result.database.products[0].stockQuantity, 8)
 })
@@ -369,6 +381,64 @@ test('bank summary includes cleared incoming and outgoing cheques', () => {
   assert.equal(summary.bankIn, 40)
   assert.equal(summary.bankOut, 15)
   assert.equal(summary.netBank, 25)
+})
+
+test('daily closing requires an opening saved for the same date', () => {
+  const database = databaseFixture()
+  const date = '2026-10-07'
+  assert.throws(
+    () => runDatabaseCommand(database, 'daily-record', { type: 'closing', date, amount: 20, counted: 18 }),
+    /Save the daily opening/,
+  )
+  const opened = runDatabaseCommand(database, 'daily-record', { type: 'opening', date, amount: 10 })
+  const closed = runDatabaseCommand(opened.database, 'daily-record', { type: 'closing', date, amount: 20, counted: 18 })
+  assert.equal(closed.record.type, 'closing')
+})
+
+test('month-end closing requires a complete monthly stock audit and audit corrects counts', () => {
+  const database = databaseFixture()
+  const date = '2026-10-31'
+  const opened = runDatabaseCommand(database, 'daily-record', { type: 'opening', date, amount: 10 })
+  assert.throws(
+    () => runDatabaseCommand(opened.database, 'daily-record', { type: 'closing', date, amount: 20, counted: 20 }),
+    /Complete the monthly stock audit/,
+  )
+
+  const audited = runDatabaseCommand(opened.database, 'stock-audit', {
+    period: 'monthly',
+    date,
+    items: [{ productId: 'product-1', countedAvailable: 7 }],
+  })
+  assert.equal(audited.record.periodKey, '2026-10')
+  assert.equal(audited.record.items[0].difference, -3)
+  assert.equal(audited.database.products[0].stockQuantity, 7)
+  assert.equal(audited.database.stockAudits.length, 1)
+  const closed = runDatabaseCommand(audited.database, 'daily-record', { type: 'closing', date, amount: 20, counted: 20 })
+  assert.equal(closed.record.type, 'closing')
+})
+
+test('stock audit cannot be saved until every product is counted', () => {
+  const database = databaseFixture()
+  database.products.push({ id: 'product-2', name: 'Second Item', stockQuantity: 5, reservedQuantity: 0 })
+  assert.throws(
+    () => runDatabaseCommand(database, 'stock-audit', { period: 'monthly', date: '2026-10-31', items: [{ productId: 'product-1', countedAvailable: 10 }] }),
+    /Review every stock item/,
+  )
+})
+
+test('daily records can be deleted without leaving a closing without its opening', () => {
+  const database = databaseFixture()
+  const date = '2026-10-07'
+  const opened = runDatabaseCommand(database, 'daily-record', { type: 'opening', date, amount: 10 })
+  const closed = runDatabaseCommand(opened.database, 'daily-record', { type: 'closing', date, amount: 20, counted: 18 })
+  assert.throws(
+    () => runDatabaseCommand(closed.database, 'delete-daily-record', { recordId: opened.record.id }),
+    /Delete the daily closing/,
+  )
+  const deletedClosing = runDatabaseCommand(closed.database, 'delete-daily-record', { recordId: closed.record.id })
+  const deletedOpening = runDatabaseCommand(deletedClosing.database, 'delete-daily-record', { recordId: opened.record.id })
+  assert.equal(deletedOpening.database.dailyClosings.length, 0)
+  assert.throws(() => runDatabaseCommand(database, 'delete-daily-record', { recordId: 'missing' }), /could not be found/)
 })
 
 test('staff permissions cannot retain or receive administrator privileges', () => {

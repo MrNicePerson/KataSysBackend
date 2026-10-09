@@ -19,6 +19,7 @@ export function createEmptyDatabase() {
     heldOrders: [],
     claims: [],
     stockMovements: [],
+    stockAudits: [],
     dailyClosings: [],
     settings: {},
     business: {},
@@ -26,6 +27,9 @@ export function createEmptyDatabase() {
     auditHistory: [],
     financeEntries: [],
     installments: [],
+    bankAccounts: [],
+    bankTransactions: [],
+    bankBalanceRecords: [],
   }
 }
 
@@ -37,6 +41,7 @@ const amountOf = (value) => {
   if (!Number.isFinite(amount) || amount < 0) throw new Error('Amounts must be zero or greater.')
   return amount
 }
+const money = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100
 const positiveQuantity = (value) => {
   const quantity = Number(value)
   if (!Number.isInteger(quantity) || quantity <= 0) throw new Error('Quantity must be a positive whole number.')
@@ -145,11 +150,16 @@ export function createSale(database, input) {
   const split = validateSplits(total, input.payments)
   if (split.cash + split.bank + split.cheque > total + 0.005) throw new Error('Combined cash, bank and cheque payments cannot exceed the bill total.')
   if (split.credit > 0 && !input.customerId) throw new Error('Choose a customer before saving a sale with an unpaid balance.')
+  const bankDetails = split.bank > 0 ? {
+    bankName: String(input.bankDetails?.bankName || '').trim(),
+    accountNumber: String(input.bankDetails?.accountNumber || '').trim(),
+    amount: split.bank,
+  } : null
   const sale = record('sale', {
     number: input.number || `INV-${String((database.counters?.sale || 0) + 1).padStart(4, '0')}`,
     date: dateOf(input.date),
     customerId: input.customerId || null,
-    customer: input.customer || '',
+    customer: input.customer || database.customers.find((entry) => entry.id === input.customerId)?.name || '',
     customerDetails: input.customerDetails || null,
     customerPhone: input.customerPhone || '',
     customerAddress: input.customerAddress || '',
@@ -160,6 +170,7 @@ export function createSale(database, input) {
     returnTotal,
     total,
     payments: { cash: split.cash, bank: split.bank, cheque: split.cheque },
+    bankDetails,
     paid: split.cash + split.bank,
     due: split.credit,
     paymentDue: input.paymentDue || '',
@@ -183,8 +194,8 @@ export function createSale(database, input) {
   if (sale.customerId && split.credit > 0) customers = updateBalance(customers, sale.customerId, split.credit)
   let next = { ...database, products, customers, sales: [sale, ...database.sales], returns: [...returnRecords, ...database.returns], stockMovements }
   if (split.cash > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'cash', amount: split.cash, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
-  if (split.bank > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'bank', amount: split.bank, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
-  if (split.cheque > 0) next = { ...next, cheques: [record('cheque', { direction: 'received', partyType: 'customer', partyId: sale.customerId, party: sale.customer, amount: split.cheque, issued: sale.date, bank: input.cheque?.bank || input.cheque?.bankName || '', number: input.cheque?.number || input.cheque?.chequeNumber || '', expectedClearanceDate: input.cheque?.dueDate || input.cheque?.expectedClearanceDate || '', sourceType: 'sale', referenceId: sale.id, status: 'Pending' }), ...next.cheques] }
+  if (split.bank > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'bank', amount: split.bank, bankDetails, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
+  if (split.cheque > 0) next = { ...next, cheques: [record('cheque', { direction: 'received', partyType: 'customer', partyId: sale.customerId, party: sale.customer, amount: split.cheque, issued: input.cheque?.chequeDate || input.cheque?.issued || sale.date, bank: input.cheque?.bank || input.cheque?.bankName || '', number: input.cheque?.number || input.cheque?.chequeNumber || '', expectedClearanceDate: input.cheque?.dueDate || input.cheque?.expectedClearanceDate || '', sourceType: 'sale', referenceId: sale.id, status: 'Pending' }), ...next.cheques] }
   next = { ...next, counters: { ...next.counters, sale: (next.counters.sale || 0) + 1 }, auditHistory: addAudit(next, 'sale', sale.id, `Sale ${sale.number || sale.id} recorded`) }
   return { database: next, record: sale }
 }
@@ -237,6 +248,7 @@ export function receivePurchase(database, input) {
   const purchase = record('purchase', {
     batchNumber: generatedBatchNumber,
     supplierBillNumber,
+    padNumber: String(input.padNumber ?? '').trim(),
     supplierId: supplier.id,
     supplier: supplier.name,
     supplierCode: supplier.supplierCode || '',
@@ -346,17 +358,105 @@ export function adjustStock(database, input) {
   return { database: next, record: result }
 }
 
-export function saveDailyRecord(database, input) {
+export function recordStockCountAudit(database, input) {
+  const date = dateOf(input.date)
+  const period = input.period === 'weekly' ? 'weekly' : 'monthly'
+  const periodKey = period === 'monthly' ? date.slice(0, 7) : date
+  if (!Array.isArray(input.items)) throw new Error('Review every stock item before saving the audit.')
+  const submitted = new Map()
+  for (const item of input.items) {
+    if (!item?.productId || submitted.has(item.productId)) throw new Error('Each stock item must be included once in the audit.')
+    submitted.set(item.productId, item.countedAvailable)
+  }
+  if (submitted.size !== database.products.length || database.products.some((product) => !submitted.has(product.id))) {
+    throw new Error('Review every stock item before saving the audit.')
+  }
+
+  let working = database
+  const items = []
+  for (const product of database.products) {
+    const countedAvailable = nonnegativeWholeQuantity(submitted.get(product.id))
+    const reserved = Number(product.reservedQuantity || 0)
+    const currentAvailable = Number(product.stockQuantity || 0) - reserved
+    const difference = countedAvailable - currentAvailable
+    if (difference) {
+      working = adjustStock(working, {
+        productId: product.id,
+        direction: difference > 0 ? 'add' : 'remove',
+        quantity: Math.abs(difference),
+        date,
+        reason: `Stock audit ${period} count correction`,
+      }).database
+    }
+    items.push({
+      productId: product.id,
+      articleName: product.article || product.code || '',
+      brandName: product.name,
+      supplierId: product.supplierId || '',
+      batchNumber: product.batchNumber || '',
+      currentAvailable,
+      countedAvailable,
+      difference,
+      costPerSuit: Number(product.averageCost || 0),
+    })
+  }
+  const audit = record('stock-audit', { period, periodKey, date, items })
+  const stockAudits = [...(working.stockAudits || []), audit]
+  const next = { ...working, stockAudits, auditHistory: addAudit(working, 'stock-audit', audit.id, `${period} stock audit completed for ${date}`) }
+  return { database: next, record: audit }
+}
+
+export function saveDailyRecord(database, input, actor = null) {
   const date = dateOf(input.date)
   const type = input.type === 'opening' ? 'opening' : 'closing'
+  if (type === 'closing' && !database.dailyClosings.some((entry) => entry.date === date && entry.type === 'opening')) {
+    throw new Error('Save the daily opening before recording the daily closing.')
+  }
+  const [year, month, day] = date.split('-').map(Number)
+  const isMonthEnd = Number.isInteger(day) && day === new Date(Date.UTC(year, month, 0)).getUTCDate()
+  const monthlyAudit = [...(database.stockAudits || [])].reverse().find((audit) => audit.period === 'monthly' && audit.periodKey === date.slice(0, 7) && audit.date === date)
+  const auditedCounts = new Map((monthlyAudit?.items || []).map((item) => [item.productId, Number(item.countedAvailable)]))
+  const stockAuditIsCurrent = Boolean(monthlyAudit)
+    && auditedCounts.size === database.products.length
+    && database.products.every((product) => auditedCounts.get(product.id) === Number(product.stockQuantity || 0) - Number(product.reservedQuantity || 0))
+  if (type === 'closing' && isMonthEnd && !stockAuditIsCurrent) {
+    throw new Error('Complete the monthly stock audit before saving this month-end closing.')
+  }
   const amount = amountOf(input.amount)
   const existing = database.dailyClosings.find((entry) => entry.date === date && entry.type === type)
+  const counted = input.counted == null ? existing?.counted ?? null : amountOf(input.counted)
+  const changed = Boolean(existing && (Number(existing.amount) !== amount || Number(existing.counted ?? existing.amount) !== Number(counted ?? amount) || String(existing.note || '') !== String(input.note || '')))
+  if (existing?.finalized && changed && !String(input.correctionReason || '').trim()) throw new Error('Enter a correction reason to update a finalized daily record.')
+  const correction = changed && existing?.finalized ? {
+    date: now(),
+    userId: String(actor?._id || ''),
+    userName: actor?.name || '',
+    reason: String(input.correctionReason).trim(),
+    previous: { amount: existing.amount, counted: existing.counted, note: existing.note || '' },
+    updated: { amount, counted, note: input.note || '' },
+  } : null
   const dailyRecord = existing
-    ? { ...existing, amount, counted: input.counted == null ? existing.counted : amountOf(input.counted), note: input.note || '' }
-    : record('daily', { date, type, amount, counted: input.counted == null ? null : amountOf(input.counted), note: input.note || '' })
+    ? { ...existing, amount, counted, note: input.note || '', updatedAt: now(), updatedById: String(actor?._id || ''), updatedByName: actor?.name || '', ...(correction ? { correctionHistory: [...(existing.correctionHistory || []), correction] } : {}) }
+    : record('daily', { date, type, amount, counted, note: input.note || '', ...(type === 'closing' && actor ? { finalized: true, closedAt: now(), closedById: String(actor._id), closedByName: actor.name || '' } : {}) })
   const dailyClosings = existing ? database.dailyClosings.map((entry) => entry.id === existing.id ? dailyRecord : entry) : [dailyRecord, ...database.dailyClosings]
-  const next = { ...database, dailyClosings, auditHistory: addAudit(database, `daily-${type}`, dailyRecord.id, `Daily ${type} saved for ${date}`) }
+  const description = correction ? `Daily ${type} corrected for ${date}: ${correction.reason}` : `Daily ${type} saved for ${date}`
+  const next = { ...database, dailyClosings, auditHistory: addAudit(database, correction ? `daily-${type}-corrected` : `daily-${type}`, dailyRecord.id, description) }
   return { database: next, record: dailyRecord }
+}
+
+export function deleteDailyRecord(database, recordId) {
+  const existing = database.dailyClosings.find((entry) => entry.id === recordId)
+  if (!existing) throw new Error('Daily record could not be found.')
+  if (existing.finalized) throw new Error('A finalized daily closing cannot be deleted. Record a correction with an audit reason instead.')
+  if (existing.type === 'opening' && database.dailyClosings.some((entry) => entry.date === existing.date && entry.type === 'closing')) {
+    throw new Error('Delete the daily closing before deleting its opening.')
+  }
+  const next = {
+    ...database,
+    dailyClosings: database.dailyClosings.filter((entry) => entry.id !== recordId),
+    auditHistory: addAudit(database, 'daily-record-deleted', existing.id, `Daily ${existing.type} deleted for ${existing.date}`),
+  }
+  return { database: next, record: existing }
 }
 
 export function saveSettings(database, settings) {
@@ -418,7 +518,7 @@ export function updateClaimStatus(database, claimId, status, resolution = '') {
   return { database: next, record: updated }
 }
 
-export function runDatabaseCommand(database, command, input = {}) {
+export function runDatabaseCommand(database, command, input = {}, context = {}) {
   switch (command) {
     case 'create-sale': return createSale(database, input)
     case 'receive-purchase': return receivePurchase(database, input)
@@ -426,7 +526,8 @@ export function runDatabaseCommand(database, command, input = {}) {
     case 'supplier-return': return processSupplierReturn(database, input)
     case 'account-payment': return recordAccountPayment(database, input)
     case 'expense': return recordExpense(database, input)
-    case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status)
+    case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status, { actor: context.actor, remarks: input.remarks, bounceDate: input.bounceDate, bounceReason: input.bounceReason, bankCharges: input.bankCharges })
+    case 'cheque-details': return updateChequeDetails(database, input, context.actor)
     case 'hold-order': return recordHeldOrder(database, input)
     case 'release-held-order': return releaseHeldOrder(database, input.heldId, 'resumed')
     case 'discard-held-order': return releaseHeldOrder(database, input.heldId, 'discarded')
@@ -434,12 +535,18 @@ export function runDatabaseCommand(database, command, input = {}) {
     case 'create-supplier': return createAccount(database, 'supplier', input)
     case 'create-product': return createProduct(database, input)
     case 'adjust-stock': return adjustStock(database, input)
-    case 'daily-record': return saveDailyRecord(database, input)
+    case 'stock-audit': return recordStockCountAudit(database, input)
+    case 'daily-record': return saveDailyRecord(database, input, context.actor)
+    case 'delete-daily-record': return deleteDailyRecord(database, input.recordId)
+    case 'create-bank-account': return createBankAccount(database, input, context.actor)
+    case 'update-bank-account': return updateBankAccount(database, input, context.actor)
+    case 'bank-transaction': return recordBankTransaction(database, input, context.actor)
+    case 'save-bank-balances': return saveBankBalances(database, input, context.actor)
     case 'save-settings': return saveSettings(database, input)
     case 'create-claim': return createClaim(database, input)
     case 'claim-status': return updateClaimStatus(database, input.claimId, input.status, input.resolution)
     case 'claim-update': return updateClaimDetails(database, input)
-    case 'create-cheque': return createManualCheque(database, input)
+    case 'create-cheque': return createManualCheque(database, input, context.actor)
     case 'partial-deliver-held-order': return partialDeliverHeldOrder(database, input)
     case 'complete-held-order': return completeHeldOrder(database, input)
     case 'finance': return recordFinanceEntry(database, input)
@@ -532,26 +639,79 @@ export function recordExpense(database, input) {
   return { database: next, record: expense }
 }
 
-export function updateChequeStatus(database, chequeId, status) {
-  if (!['Cleared', 'Returned', 'Cancelled', 'Bounced'].includes(status)) throw new Error('Cheque status must be Cleared, Returned, Bounced, or Cancelled.')
+export function updateChequeStatus(database, chequeId, status, options = {}) {
+  const allowedStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Cleared', 'Returned', 'Cancelled', 'Bounced', 'Bounced / Dishonoured', 'Rescheduled', 'Replaced']
+  if (!allowedStatuses.includes(status)) throw new Error('Choose a valid cheque transaction status.')
   const cheque = database.cheques.find((entry) => entry.id === chequeId)
   if (!cheque) throw new Error('Cheque could not be found.')
-  const normalized = status
-  if (cheque.status === normalized || cheque.status === status) return { database, record: cheque }
-  if (normalized === 'Cancelled') {
-    if (cheque.status !== 'Pending') throw new Error('Only pending cheques can be cancelled.')
-    const updated = { ...cheque, status: 'Cancelled', cancelledAt: now() }
-    const next = { ...database, cheques: database.cheques.map((entry) => entry.id === chequeId ? updated : entry), auditHistory: addAudit(database, 'cheque-status', cheque.id, 'Cheque cancelled') }
-    return { database: next, record: updated }
+  if (cheque.status === status) return { database, record: cheque }
+  const previousStatus = cheque.status || 'Pending'
+  const pendingStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled']
+  const bounced = ['Returned', 'Bounced', 'Bounced / Dishonoured'].includes(status)
+  if (status === 'Cancelled' && !pendingStatuses.includes(previousStatus)) throw new Error('Only unresolved cheques can be cancelled.')
+  if (status === 'Cleared' && !pendingStatuses.includes(previousStatus)) throw new Error(`Cannot clear a ${previousStatus.toLowerCase()} cheque.`)
+  if (bounced && !pendingStatuses.includes(previousStatus) && previousStatus !== 'Cleared') throw new Error(`Cannot bounce a ${previousStatus.toLowerCase()} cheque.`)
+  const timestamp = now()
+  const historyEntry = {
+    previousStatus,
+    status,
+    date: timestamp,
+    userId: String(options.actor?._id || ''),
+    userName: options.actor?.name || '',
+    remarks: String(options.remarks || '').trim(),
   }
-  if (cheque.status !== 'Pending' && !(cheque.status === 'Cleared' && ['Returned', 'Bounced'].includes(normalized))) throw new Error(`Cannot change a ${cheque.status.toLowerCase()} cheque to ${normalized.toLowerCase()}.`)
-  let next = { ...database, cheques: database.cheques.map((entry) => entry.id === chequeId ? { ...entry, status: normalized, clearedAt: normalized === 'Cleared' ? now() : entry.clearedAt || null } : entry) }
-  if ((normalized === 'Cleared' || cheque.status === 'Cleared') && cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, normalized === 'Cleared' ? -cheque.amount : cheque.amount) }
-    if ((normalized === 'Cleared' || cheque.status === 'Cleared') && cheque.partyType === 'supplier' && cheque.partyId && !cheque.appliedToBalance) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, normalized === 'Cleared' ? -cheque.amount : cheque.amount) }
-  if (normalized === 'Cleared' && !cheque.appliedToBalance) next = { ...next, payments: addPayment(next, { type: cheque.partyType === 'customer' ? 'customer-payment' : 'supplier-payment', method: 'cheque-cleared', amount: cheque.amount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf() }) }
-  if (['Returned', 'Bounced'].includes(normalized) && cheque.status === 'Cleared') next = { ...next, payments: addPayment(next, { type: 'cheque-reversal', method: 'cheque-returned', amount: cheque.amount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf() }) }
-  next = { ...next, auditHistory: addAudit(next, 'cheque-status', cheque.id, `Cheque marked ${normalized.toLowerCase()}`) }
+  const updated = {
+    ...cheque,
+    status,
+    statusHistory: [...(cheque.statusHistory || []), historyEntry],
+    ...(status === 'Cleared' ? { clearedAt: timestamp, actualClearanceDate: dateOf() } : {}),
+    ...(status === 'Cancelled' ? { cancelledAt: timestamp } : {}),
+    ...(bounced ? {
+      bounceDate: options.bounceDate || dateOf(),
+      bounceReason: String(options.bounceReason || options.remarks || '').trim(),
+      bankCharges: Number(options.bankCharges || 0),
+    } : {}),
+  }
+  let next = { ...database, cheques: database.cheques.map((entry) => entry.id === chequeId ? updated : entry) }
+  if (status === 'Cleared' && !cheque.appliedToBalance) {
+    if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, -Number(cheque.amount || 0)) }
+    if (cheque.partyType === 'supplier' && cheque.partyId) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, -Number(cheque.amount || 0)) }
+    next = { ...next, cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: true } : entry), payments: addPayment(next, { type: cheque.partyType === 'customer' ? 'customer-payment' : 'supplier-payment', method: 'cheque-cleared', amount: cheque.amount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf() }) }
+  }
+  if (bounced && cheque.status === 'Cleared' && cheque.appliedToBalance) {
+    if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, Number(cheque.amount || 0)) }
+    if (cheque.partyType === 'supplier' && cheque.partyId) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, Number(cheque.amount || 0)) }
+    next = { ...next, cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: false } : entry), payments: addPayment(next, { type: 'cheque-reversal', method: 'cheque-returned', amount: cheque.amount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf() }) }
+  }
+  const auditHistory = [...next.auditHistory, record('audit', { type: 'cheque-status', referenceId: cheque.id, description: `Cheque marked ${status.toLowerCase()}${historyEntry.remarks ? `: ${historyEntry.remarks}` : ''}`, date: timestamp, userId: historyEntry.userId, userName: historyEntry.userName })]
+  next = { ...next, auditHistory }
   return { database: next, record: next.cheques.find((entry) => entry.id === chequeId) }
+}
+
+export function updateChequeDetails(database, input, actor = null) {
+  const cheque = database.cheques.find((entry) => entry.id === input.chequeId)
+  if (!cheque) throw new Error('Cheque could not be found.')
+  const dueDate = String(input.expectedClearanceDate ?? cheque.expectedClearanceDate ?? '').slice(0, 10)
+  if (dueDate && Number.isNaN(Date.parse(`${dueDate}T00:00:00Z`))) throw new Error('Enter a valid expected clearance date.')
+  const oldDate = cheque.expectedClearanceDate || ''
+  const changedDate = dueDate !== oldDate
+  const remark = String(input.remarks || '').trim()
+  if (changedDate && !remark) throw new Error('Enter a reason when rescheduling a cheque.')
+  const timestamp = now()
+  const updated = {
+    ...cheque,
+    expectedClearanceDate: dueDate,
+    notes: input.notes == null ? cheque.notes || '' : String(input.notes).trim(),
+    followUpNote: input.followUpNote == null ? cheque.followUpNote || '' : String(input.followUpNote).trim(),
+    ...(changedDate ? {
+      status: ['Pending', 'Deposited / Presented', 'Under Clearing'].includes(cheque.status) ? 'Rescheduled' : cheque.status,
+      rescheduleCount: Number(cheque.rescheduleCount || 0) + 1,
+      rescheduleHistory: [...(cheque.rescheduleHistory || []), { previousDate: oldDate, updatedDate: dueDate, date: timestamp, reason: remark, userId: String(actor?._id || ''), userName: actor?.name || '' }],
+      statusHistory: [...(cheque.statusHistory || []), { previousStatus: cheque.status || 'Pending', status: 'Rescheduled', date: timestamp, userId: String(actor?._id || ''), userName: actor?.name || '', remarks: remark }],
+    } : {}),
+  }
+  const next = { ...database, cheques: database.cheques.map((entry) => entry.id === cheque.id ? updated : entry), auditHistory: [...database.auditHistory, record('audit', { type: changedDate ? 'cheque-rescheduled' : 'cheque-follow-up', referenceId: cheque.id, description: changedDate ? `Cheque rescheduled from ${oldDate} to ${dueDate}: ${remark}` : `Cheque follow-up updated${remark ? `: ${remark}` : ''}`, date: timestamp, userId: String(actor?._id || ''), userName: actor?.name || '' })] }
+  return { database: next, record: updated }
 }
 
 export function recordHeldOrder(database, input) {
@@ -607,8 +767,141 @@ export function calculateDailyClosing(database, date) {
   const supplierPayments = sumPayment((entry) => entry.type === 'supplier-payment' && entry.method === 'cash')
   const cashExpenses = database.expenses.filter((entry) => sameDate(entry) && entry.method === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const cashRefunds = sumPayment((entry) => entry.type === 'customer-refund' && entry.method === 'cash')
-  const expectedCash = opening + cashSales + customerPayments - supplierPayments - cashExpenses - cashRefunds
-  return { date, opening, cashSales, customerPayments, supplierPayments, cashExpenses, cashRefunds, expectedCash }
+  const cashOtherReceipts = (database.financeEntries || []).filter((entry) => sameDate(entry) && entry.type === 'capital' && entry.method === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  const bankTransactions = (database.bankTransactions || []).filter((entry) => sameDate(entry))
+  const cashWithdrawals = bankTransactions.filter((entry) => entry.type === 'withdrawal' && entry.destination === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  const cashDeposits = bankTransactions.filter((entry) => entry.type === 'deposit' && entry.source === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  const expectedCash = money(opening + cashSales + customerPayments + cashOtherReceipts + cashWithdrawals - supplierPayments - cashExpenses - cashRefunds - cashDeposits)
+  return { date, opening, cashSales, customerPayments, cashOtherReceipts, supplierPayments, cashExpenses, cashRefunds, cashWithdrawals, cashDeposits, expectedCash }
+}
+
+export function calculateBankBalanceSummary(database, date) {
+  const accounts = database.bankAccounts || []
+  const transactions = database.bankTransactions || []
+  const records = database.bankBalanceRecords || []
+  const rows = accounts.map((account) => {
+    const accountRecords = records.filter((entry) => entry.accountId === account.id && entry.date < date)
+      .sort((left, right) => right.date.localeCompare(left.date) || String(right.createdAt).localeCompare(String(left.createdAt)))
+    const previous = accountRecords[0] || null
+    const baseline = Number(previous?.closingBalance ?? account.openingBalance ?? 0)
+    const fromDate = previous?.date || ''
+    let expectedBalance = baseline
+    for (const transaction of transactions) {
+      if (transaction.date > date || transaction.date <= fromDate) continue
+      const amount = Number(transaction.amount || 0)
+      if (transaction.accountId === account.id) {
+        if (transaction.type === 'withdrawal' || transaction.type === 'transfer') expectedBalance -= amount
+        if (transaction.type === 'deposit') expectedBalance += amount
+      }
+      if (['transfer', 'withdrawal'].includes(transaction.type) && transaction.destination === 'account' && transaction.destinationAccountId === account.id) expectedBalance += amount
+    }
+    expectedBalance = money(expectedBalance)
+    const dayRecord = records.filter((entry) => entry.accountId === account.id && entry.date === date)
+      .sort((left, right) => Number(right.revision || 0) - Number(left.revision || 0) || String(right.createdAt).localeCompare(String(left.createdAt)))[0]
+    const currentBalance = Number(dayRecord?.closingBalance ?? expectedBalance)
+    return {
+      accountId: account.id,
+      name: account.name,
+      active: account.active !== false,
+      previousBalance: money(previous?.closingBalance ?? account.openingBalance ?? 0),
+      expectedBalance,
+      currentBalance: money(currentBalance),
+      difference: dayRecord ? money(currentBalance - Number(dayRecord.expectedBalance ?? expectedBalance)) : 0,
+      note: dayRecord?.note || '',
+      lastUpdatedAt: dayRecord?.createdAt || null,
+    }
+  })
+  return {
+    date,
+    accounts: rows,
+    previousTotal: money(rows.filter((row) => row.active).reduce((sum, row) => sum + row.previousBalance, 0)),
+    expectedTotal: money(rows.filter((row) => row.active).reduce((sum, row) => sum + row.expectedBalance, 0)),
+    currentTotal: money(rows.filter((row) => row.active).reduce((sum, row) => sum + row.currentBalance, 0)),
+  }
+}
+
+export function createBankAccount(database, input, actor = null) {
+  const name = String(input.name || '').trim()
+  if (!name) throw new Error('Enter a bank or wallet name.')
+  if ((database.bankAccounts || []).some((entry) => entry.name.toLowerCase() === name.toLowerCase())) throw new Error('A bank account with this name already exists.')
+  const account = record('bank-account', { name, openingBalance: money(amountOf(input.openingBalance ?? 0)), active: true, createdById: String(actor?._id || ''), createdByName: actor?.name || '' })
+  const next = { ...database, bankAccounts: [account, ...(database.bankAccounts || [])], auditHistory: addAudit(database, 'bank-account-created', account.id, `Bank account ${name} created`) }
+  return { database: next, record: account }
+}
+
+export function updateBankAccount(database, input, actor = null) {
+  const account = (database.bankAccounts || []).find((entry) => entry.id === input.accountId)
+  if (!account) throw new Error('Bank account could not be found.')
+  const name = input.name == null ? account.name : String(input.name).trim()
+  if (!name) throw new Error('Enter a bank or wallet name.')
+  if ((database.bankAccounts || []).some((entry) => entry.id !== account.id && entry.name.toLowerCase() === name.toLowerCase())) throw new Error('A bank account with this name already exists.')
+  const updated = { ...account, name, active: input.active == null ? account.active !== false : Boolean(input.active), updatedAt: now(), updatedById: String(actor?._id || ''), updatedByName: actor?.name || '' }
+  const next = { ...database, bankAccounts: database.bankAccounts.map((entry) => entry.id === account.id ? updated : entry), auditHistory: addAudit(database, 'bank-account-updated', account.id, `Bank account ${name} updated`) }
+  return { database: next, record: updated }
+}
+
+export function recordBankTransaction(database, input, actor = null) {
+  const type = input.type
+  if (!['withdrawal', 'deposit', 'transfer'].includes(type)) throw new Error('Bank transaction must be a withdrawal, deposit, or transfer.')
+  const amount = money(amountOf(input.amount))
+  if (amount <= 0) throw new Error('Enter an amount greater than zero.')
+  const transactionDate = dateOf(input.date)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(transactionDate) || Number.isNaN(Date.parse(`${transactionDate}T00:00:00Z`))) throw new Error('Enter a valid transaction date.')
+  const account = (database.bankAccounts || []).find((entry) => entry.id === input.accountId && entry.active !== false)
+  if (!account) throw new Error('Select an active bank account.')
+  const destinationAccount = input.destinationAccountId
+    ? database.bankAccounts.find((entry) => entry.id === input.destinationAccountId && entry.active !== false)
+    : null
+  if (type === 'transfer' && (!destinationAccount || destinationAccount.id === account.id)) throw new Error('Choose a different active destination bank account.')
+  if (type === 'withdrawal' && input.destination === 'account' && (!destinationAccount || destinationAccount.id === account.id)) throw new Error('Choose a different active destination account.')
+  const transaction = record('bank-transaction', {
+    type,
+    accountId: account.id,
+    destinationAccountId: destinationAccount?.id || '',
+    source: type === 'deposit' ? 'cash' : 'bank',
+    destination: type === 'withdrawal' ? (input.destination === 'account' ? 'account' : 'cash') : type === 'transfer' ? 'account' : 'bank',
+    amount,
+    date: transactionDate,
+    reference: String(input.reference || '').trim(),
+    note: String(input.note || '').trim(),
+    responsibleUserId: String(actor?._id || ''),
+    responsibleUserName: actor?.name || '',
+  })
+  const next = { ...database, bankTransactions: [transaction, ...(database.bankTransactions || [])], auditHistory: addAudit(database, 'bank-transaction', transaction.id, `${type} of Rs. ${amount} from ${account.name} recorded`) }
+  return { database: next, record: transaction }
+}
+
+export function saveBankBalances(database, input, actor = null) {
+  const date = dateOf(input.date)
+  if (!Array.isArray(input.balances) || !input.balances.length) throw new Error('Enter at least one bank closing balance.')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00Z`))) throw new Error('Enter a valid bank closing date.')
+  const records = [...(database.bankBalanceRecords || [])]
+  const createdAt = now()
+  for (const entry of input.balances) {
+    const account = database.bankAccounts.find((row) => row.id === entry.accountId && row.active !== false)
+    if (!account) throw new Error('A selected bank account is missing or inactive.')
+    if (entry.closingBalance == null || entry.closingBalance === '' || !Number.isFinite(Number(entry.closingBalance))) throw new Error(`Enter a valid closing balance for ${account.name}.`)
+    const closingBalance = money(amountOf(entry.closingBalance))
+    const summary = calculateBankBalanceSummary({ ...database, bankBalanceRecords: records }, date)
+    const expectedBalance = summary.accounts.find((row) => row.accountId === account.id)?.expectedBalance ?? Number(account.openingBalance || 0)
+    const revision = records.filter((row) => row.accountId === account.id && row.date === date).reduce((highest, row) => Math.max(highest, Number(row.revision || 0)), 0) + 1
+    records.unshift(record('bank-balance', {
+      accountId: account.id,
+      accountName: account.name,
+      date,
+      closingBalance,
+      previousBalance: summary.accounts.find((row) => row.accountId === account.id)?.previousBalance || 0,
+      expectedBalance,
+      difference: money(closingBalance - expectedBalance),
+      note: String(entry.note || '').trim(),
+      revision,
+      createdAt,
+      responsibleUserId: actor?.id || '',
+      responsibleUserName: actor?.name || '',
+    }))
+  }
+  const next = { ...database, bankBalanceRecords: records, auditHistory: addAudit(database, 'bank-balances-saved', date, `Bank closing balances saved for ${date}`) }
+  return { database: next, record: records.filter((entry) => entry.date === date && entry.createdAt === createdAt) }
 }
 
 export function calculateBusinessTotals(database) {
@@ -682,15 +975,17 @@ export function validateBackup(data) {
   }
   if (!data || typeof data !== 'object' || data.version !== APP_DB_VERSION) throw new Error('Unsupported or invalid application backup.')
   const database = createEmptyDatabase()
+  const additiveCollections = new Set(['bankAccounts', 'bankTransactions', 'bankBalanceRecords'])
   for (const key of Object.keys(database)) {
     if (Array.isArray(database[key])) {
-      if (!Array.isArray(data[key])) throw new Error(`Backup is missing a valid ${key} collection.`)
+      if (!Array.isArray(data[key]) && !additiveCollections.has(key)) throw new Error(`Backup is missing a valid ${key} collection.`)
+      const rows = data[key] || []
       const ids = new Set()
-      for (const item of data[key]) {
+      for (const item of rows) {
         if (!item || typeof item !== 'object' || !item.id || ids.has(item.id)) throw new Error(`The ${key} collection contains an invalid or duplicate ID.`)
         ids.add(item.id)
       }
-      database[key] = data[key]
+      database[key] = rows
     } else if (key === 'version') {
       database.version = APP_DB_VERSION
     } else if (data[key] && typeof data[key] === 'object' && !Array.isArray(data[key])) {
@@ -747,9 +1042,14 @@ function validateRelationships(database) {
     assertReference('products', entry.productId, 'claim/product relationship')
     assertReference('suppliers', entry.supplierId, 'claim/supplier relationship')
   }
+  for (const transaction of database.bankTransactions) {
+    assertReference('bankAccounts', transaction.accountId, 'bank transaction/account relationship')
+    assertReference('bankAccounts', transaction.destinationAccountId, 'bank transfer destination/account relationship')
+  }
+  for (const balance of database.bankBalanceRecords) assertReference('bankAccounts', balance.accountId, 'bank balance/account relationship')
 }
 
-export function createManualCheque(database, input) {
+export function createManualCheque(database, input, actor = null) {
   const amount = amountOf(input.amount)
   if (!amount) throw new Error('Cheque amount must be greater than zero.')
   const direction = input.direction === 'given' ? 'given' : 'received'
@@ -766,10 +1066,14 @@ export function createManualCheque(database, input) {
     number: String(input.number || '').trim(),
     bank: String(input.bank || '').trim(),
     issued: dateOf(input.issued || input.date),
+    dueDate: input.dueDate || input.expectedClearanceDate || '',
     expectedClearanceDate: input.expectedClearanceDate || '',
+    notes: String(input.notes || '').trim(),
     sourceType: input.sourceType || 'manual',
     referenceId: input.referenceId || '',
     status: 'Pending',
+    createdById: String(actor?._id || ''),
+    createdByName: actor?.name || '',
   })
   const next = { ...database, cheques: [cheque, ...database.cheques], auditHistory: addAudit(database, 'cheque', cheque.id, `Manual ${direction} cheque recorded`) }
   return { database: next, record: cheque }
@@ -1026,20 +1330,36 @@ export function updateSaleBill(database, input) {
   }
   if (!sale.payments || !['paid', 'credit'].includes(sale.status)) throw new Error('This bill has incomplete payment history and cannot be edited safely.')
   const originalItems = sale.items || []
-  if (!Array.isArray(input.items) || input.items.length !== originalItems.length || !originalItems.length) throw new Error('Keep the existing bill items when editing quantities and rates.')
+  if (!originalItems.length) throw new Error('This bill has no saved items to reconcile safely.')
+  if (!Array.isArray(input.items) || input.items.length === 0) throw new Error('A bill must keep at least one item. Add an item before saving.')
   const movements = database.stockMovements.filter((entry) => entry.type === 'sale' && entry.referenceId === sale.id)
   if (movements.length !== originalItems.length) throw new Error('This bill has incomplete stock movement history and cannot be edited safely.')
   if (movements.some((movement, index) => movement.productId !== originalItems[index].productId)) throw new Error('This bill has mismatched stock movement history and cannot be edited safely.')
   const itemByLine = new Map(originalItems.map((item) => [item.lineId, item]))
-  if (itemByLine.size !== originalItems.length || input.items.some((item) => !itemByLine.has(item.lineId)) || new Set(input.items.map((item) => item.lineId)).size !== originalItems.length) {
-    throw new Error('Bill items must match the saved bill.')
-  }
-  const changed = new Map(input.items.map((item) => [item.lineId, item]))
-  const items = originalItems.map((item) => {
-    const submitted = changed.get(item.lineId)
+  if (itemByLine.size !== originalItems.length) throw new Error('This bill has duplicate item line history and cannot be edited safely.')
+  const retainedLineIds = new Set()
+  const items = input.items.map((submitted) => {
+    const lineId = String(submitted.lineId || '').trim()
     const quantity = positiveQuantity(submitted.quantity)
     const price = amountOf(submitted.price)
-    return { ...item, quantity, price, unitPrice: price, lineTotal: quantity * price }
+    if (lineId) {
+      const original = itemByLine.get(lineId)
+      if (!original || retainedLineIds.has(lineId)) throw new Error('Bill items must use unique saved item lines.')
+      retainedLineIds.add(lineId)
+      return { ...original, quantity, price, unitPrice: price, lineTotal: quantity * price }
+    }
+    const product = getProduct(database.products, { productId: submitted.productId })
+    return {
+      lineId: makeId('line'),
+      productId: product.id,
+      code: product.code ?? '',
+      name: product.name,
+      quantity,
+      price,
+      unitPrice: price,
+      unitCostAtSale: Number(product.averageCost || 0),
+      lineTotal: quantity * price,
+    }
   })
   const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0)
   const discount = amountOf(input.discount ?? sale.discount ?? 0)
@@ -1062,14 +1382,15 @@ export function updateSaleBill(database, input) {
   }
   const products = database.products.map((product) => ({ ...product, stockQuantity: Number(product.stockQuantity || 0) + (oldByProduct.get(product.id) || 0) - (newByProduct.get(product.id) || 0) }))
   const updated = { ...sale, items, subtotal, discount, total, due, status: due > 0 ? 'credit' : 'paid' }
-  let movementIndex = 0
-  const stockMovements = database.stockMovements.map((movement) => {
-    if (movement.type !== 'sale' || movement.referenceId !== sale.id) return movement
-    const item = items[movementIndex++]
-    return { ...movement, productId: item.productId, quantity: -item.quantity }
+  const movementByLine = new Map(originalItems.map((item, index) => [item.lineId, movements[index]]))
+  const retainedMovements = database.stockMovements.filter((movement) => movement.type !== 'sale' || movement.referenceId !== sale.id)
+  const updatedMovements = items.map((item) => {
+    const originalMovement = movementByLine.get(item.lineId)
+    if (originalMovement) return { ...originalMovement, productId: item.productId, quantity: -item.quantity }
+    return record('move', { productId: item.productId, type: 'sale', quantity: -item.quantity, referenceId: sale.id, date: sale.date, note: sale.number || 'Sale' })
   })
   const customers = sale.customerId ? updateBalance(database.customers, sale.customerId, due - Number(sale.due || 0)) : database.customers
-  const next = { ...database, sales: database.sales.map((entry) => entry.id === sale.id ? updated : entry), products, customers, stockMovements, auditHistory: addAudit(database, 'sale-bill-update', sale.id, `Bill ${sale.number} quantities and rates updated`) }
+  const next = { ...database, sales: database.sales.map((entry) => entry.id === sale.id ? updated : entry), products, customers, stockMovements: [...retainedMovements, ...updatedMovements], auditHistory: addAudit(database, 'sale-bill-update', sale.id, `Bill ${sale.number} items, quantities or rates updated`) }
   return { database: next, record: updated }
 }
 

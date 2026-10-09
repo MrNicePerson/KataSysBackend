@@ -21,7 +21,15 @@ import { returnsRouter } from './routes/returns.routes.js'
 import { salesRouter } from './routes/sales.routes.js'
 import { suppliersRouter } from './routes/suppliers.routes.js'
 import { workspaceRouter } from './routes/workspace.routes.js'
+import { notificationsRouter } from './routes/notifications.routes.js'
+import { deliverDueNotifications } from './domain/notifications.js'
 
+import dns from 'dns'
+
+dns.setServers([
+  '1.1.1.1',
+  '8.8.8.8',
+])
 
 const app = express()
 
@@ -145,6 +153,8 @@ protectedApi.use(
   workspaceRouter
 )
 
+protectedApi.use('/notifications', notificationsRouter)
+
 
 // Sales
 protectedApi.use(
@@ -256,6 +266,12 @@ app.use(errorHandler)
 // =====================================================
 
 const server = await connectDatabase().then(() => {
+
+  const notificationWorker = setInterval(() => {
+    deliverDueNotifications().catch((error) => console.error('Notification scheduler failed:', error.message))
+  }, 60_000)
+  notificationWorker.unref()
+  deliverDueNotifications().catch((error) => console.error('Notification scheduler failed:', error.message))
 
   return app.listen(
     env.port,

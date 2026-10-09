@@ -94,13 +94,67 @@ export function withLock(work) {
   return run
 }
 
-export async function runCommand(command, input = {}) {
+function describeAuditType(type, description = '') {
+  const value = `${type} ${description}`.toLowerCase()
+  const module = value.includes('sale') ? 'Sales'
+    : value.includes('purchase') || value.includes('receiv') ? 'Purchases'
+      : value.includes('stock') || value.includes('product') ? 'Stock'
+        : value.includes('supplier') ? 'Suppliers'
+          : value.includes('customer') || value.includes('return') ? 'Customers / Returns'
+            : value.includes('cheque') ? 'Cheques'
+              : value.includes('daily') || value.includes('closing') ? 'Daily Open & Closing'
+                : value.includes('bank') || value.includes('finance') || value.includes('payment') || value.includes('expense') ? 'Payments & Finance'
+                  : value.includes('user') || value.includes('permission') ? 'Users & Permissions'
+                    : value.includes('setting') ? 'Settings'
+                      : value.includes('notification') ? 'Notifications'
+                        : 'General'
+  const action = /delet|remov|discard|cancel/.test(value) ? 'Deleted'
+    : /updat|edit|correct|reschedul|status|mark|approv|clear|bounce/.test(value) ? 'Updated'
+      : /login/.test(value) ? 'Login'
+        : /logout|sign out/.test(value) ? 'Logout'
+          : /creat|record|sav|receiv|held|added|created/.test(value) ? 'Created'
+            : 'Activity'
+  return { module, action }
+}
+
+export async function runCommand(command, input = {}, actor = null) {
   return withLock(async () => {
     const current = await getSnapshot()
-    const result = runDatabaseCommand(current, command, input)
+    const result = runDatabaseCommand(current, command, input, { actor })
+    if (actor && command !== 'restore-backup') {
+      const previousIds = new Set((current.auditHistory || []).map((entry) => entry.id))
+      result.database.auditHistory = result.database.auditHistory.map((entry) => {
+        if (previousIds.has(entry.id) || entry.userId) return entry
+        const { module, action } = describeAuditType(entry.type, entry.description)
+        return { ...entry, module, action, userId: String(actor._id || actor.id || ''), userName: actor.name || '' }
+      })
+    }
     if (command === 'bulk-recovery') await persistBulkRecovery(current, result.database)
     else await persistSnapshot(result.database)
     return result.record
+  })
+}
+
+export async function appendAuditEntry({ type, referenceId = '', description, details = null }, actor = null) {
+  return withLock(async () => {
+    const current = await getSnapshot()
+    const { module, action } = describeAuditType(type, description)
+    const id = `audit-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`
+    const entry = {
+      id,
+      type,
+      module,
+      action,
+      referenceId,
+      description,
+      details,
+      date: new Date().toISOString(),
+      userId: String(actor?._id || actor?.id || ''),
+      userName: actor?.name || '',
+    }
+    await collectionModels.auditHistory.create(entry)
+    cache = { ...current, auditHistory: [...(current.auditHistory || []), entry] }
+    return entry
   })
 }
 

@@ -13,10 +13,11 @@ const input = (extra = {}) => ({ supplierId: 'aa', arrivalDate: '2026-10-03', re
   items: ['Product A', 'Product B', 'Product C'].map((productName, index) => ({ productName, code: `P${index}`, quantity: 2, unitCost: 100, batchNumber: `OLD-ITEM-${index}` })), ...extra })
 
 test('one receiving batch persists on the bill and every product, item and movement', async () => {
-  const result = receivePurchase(fixture(), input())
+  const result = receivePurchase(fixture(), input({ padNumber: ' PAD-304 ' }))
   const { record: purchase, database } = result
   assert.equal(purchase.batchNumber, 'AA-03102026-001')
   assert.equal(purchase.supplierBillNumber, 1)
+  assert.equal(purchase.padNumber, 'PAD-304')
   assert.equal(purchase.supplierCode, 'AA')
   assert.equal(purchase.reference, undefined)
   assert.equal(purchase.items.length, 3)
@@ -31,6 +32,7 @@ test('one receiving batch persists on the bill and every product, item and movem
   await document.validate()
   const serialized = JSON.parse(JSON.stringify(document.toObject()))
   assert.equal(serialized.batchNumber, purchase.batchNumber)
+  assert.equal(serialized.padNumber, 'PAD-304')
   assert.equal(serialized.supplierCode, 'AA')
   assert.ok(serialized.items.every((item) => item.batchNumber === purchase.batchNumber))
   assert.ok(collectionModels.purchases.schema.indexes().some(([keys, options]) => keys.batchNumber === 1 && options.unique && options.partialFilterExpression))

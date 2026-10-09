@@ -33,5 +33,6 @@ productsRouter.get('/:id', (req, res) => {
 })
 
 productsRouter.post('/', mutate('create-product'))
+productsRouter.post('/stock-audit', mutate('stock-audit'))
 productsRouter.patch('/:id', mutate('update-product', { status: 200, input: (req) => ({ ...req.body, productId: req.params.id }) }))
 productsRouter.post('/:id/adjust-stock', mutate('adjust-stock', { input: (req) => ({ ...req.body, productId: req.params.id }) }))

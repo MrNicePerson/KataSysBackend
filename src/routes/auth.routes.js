@@ -3,7 +3,7 @@ import { Router } from 'express'
 import { ALL_PERMISSIONS, User, normalizePermissions, publicUser } from '../models/User.js'
 import { authRequired, currentUserPayload, requirePermission, signToken } from '../middleware/auth.js'
 import { asyncHandler } from '../middleware/errorHandler.js'
-import { getSnapshot } from '../store/snapshotStore.js'
+import { appendAuditEntry, getSnapshot } from '../store/snapshotStore.js'
 
 export const authRouter = Router()
 
@@ -54,12 +54,18 @@ authRouter.post('/login', asyncHandler(async (req, res) => {
     error.status = 401
     throw error
   }
+  await appendAuditEntry({ type: 'login', referenceId: String(user._id), description: `${user.name} signed in` }, user).catch((error) => console.error('Could not log sign-in:', error.message))
   res.json({ token: signToken(user), user: publicUser(user) })
 }))
 
 authRouter.get('/me', authRequired, (req, res) => {
   res.json({ user: currentUserPayload(req.user) })
 })
+
+authRouter.post('/logout', authRequired, asyncHandler(async (req, res) => {
+  await appendAuditEntry({ type: 'logout', referenceId: String(req.user._id), description: `${req.user.name} signed out` }, req.user)
+  res.json({ ok: true })
+}))
 
 authRouter.get('/users', authRequired, requirePermission('admin'), asyncHandler(async (_req, res) => {
   const users = await User.find().sort({ createdAt: -1 })
@@ -85,6 +91,7 @@ authRouter.post('/users', authRequired, requirePermission('admin'), asyncHandler
     role: role === 'admin' ? 'admin' : 'staff',
     permissions: normalizePermissions(role === 'admin' ? 'admin' : 'staff', {}, permissions),
   })
+  await appendAuditEntry({ type: 'user-created', referenceId: String(user._id), description: `User ${user.name} created`, details: { role: user.role, permissions: user.permissions } }, req.user).catch((error) => console.error('Could not log user creation:', error.message))
   res.status(201).json({ data: publicUser(user) })
 }))
 
@@ -97,15 +104,33 @@ authRouter.patch('/users/:id', authRequired, requirePermission('admin'), asyncHa
   }
   if (req.body.name) user.name = req.body.name
   const previousRole = user.role
+  const previousPermissions = previousRole === 'admin' ? { ...ALL_PERMISSIONS } : { ...(user.permissions || {}) }
   if (req.body.role != null && !['admin', 'staff'].includes(req.body.role)) {
     const error = new Error('Role must be admin or staff.')
     error.status = 400
     throw error
   }
   if (req.body.role) user.role = req.body.role
+  if (previousRole === 'admin' && user.role !== 'admin') {
+    if (String(req.user._id) === String(user._id)) {
+      const error = new Error('You cannot remove your own administrator access.')
+      error.status = 400
+      throw error
+    }
+    if (await User.countDocuments({ role: 'admin', active: true }) <= 1) {
+      const error = new Error('The last active administrator cannot be demoted.')
+      error.status = 400
+      throw error
+    }
+  }
+  if (previousRole === 'admin' && user.active && req.body.active === false && await User.countDocuments({ role: 'admin', active: true }) <= 1) {
+    const error = new Error('The last active administrator cannot be deactivated.')
+    error.status = 400
+    throw error
+  }
   if (req.body.active != null) user.active = Boolean(req.body.active)
   if (req.body.permissions) {
-    user.permissions = normalizePermissions(user.role, previousRole === 'admin' ? {} : user.permissions.toObject(), req.body.permissions)
+    user.permissions = normalizePermissions(user.role, previousRole === 'admin' ? {} : previousPermissions, req.body.permissions)
   } else if (previousRole === 'admin' && user.role === 'staff') {
     user.permissions = normalizePermissions('staff')
   }
@@ -116,7 +141,14 @@ authRouter.patch('/users/:id', authRequired, requirePermission('admin'), asyncHa
   }
   if (req.body.password) user.passwordHash = await bcrypt.hash(String(req.body.password), 10)
   if (user.role === 'admin') user.permissions = ALL_PERMISSIONS
+  const nextPermissions = user.role === 'admin' ? ALL_PERMISSIONS : normalizePermissions(user.role, { ...(user.permissions || {}) }, req.body.permissions || {})
+  const changedPermissions = [...new Set([...Object.keys(previousPermissions), ...Object.keys(nextPermissions)])]
+    .filter((key) => Boolean(previousPermissions[key]) !== Boolean(nextPermissions[key]))
+  user.permissions = nextPermissions
   await user.save()
+  if (changedPermissions.length || req.body.role != null) {
+    await appendAuditEntry({ type: 'user-permissions-updated', referenceId: String(user._id), description: `Access updated for ${user.name}`, details: { changedPermissions, role: user.role } }, req.user).catch((error) => console.error('Could not log permission change:', error.message))
+  }
   res.json({ data: publicUser(user) })
 }))
 
@@ -133,12 +165,13 @@ authRouter.delete('/users/:id', authRequired, requirePermission('admin'), asyncH
     error.status = 404
     throw error
   }
-  if (user.role === 'admin' && await User.countDocuments({ role: 'admin' }) <= 1) {
+  if (user.role === 'admin' && user.active && await User.countDocuments({ role: 'admin', active: true }) <= 1) {
     const error = new Error('The last administrator cannot be deleted.')
     error.status = 400
     throw error
   }
 
   await user.deleteOne()
+  await appendAuditEntry({ type: 'user-deleted', referenceId: String(user._id), description: `User ${user.name} deleted`, details: { email: user.email, role: user.role } }, req.user).catch((error) => console.error('Could not log user deletion:', error.message))
   res.status(204).end()
 }))
