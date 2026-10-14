@@ -7,6 +7,11 @@ import { appendAuditEntry, getSnapshot } from '../store/snapshotStore.js'
 
 export const authRouter = Router()
 
+function exactEmailMatch(email) {
+  const escaped = email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`^${escaped}$`, 'i')
+}
+
 authRouter.get('/bootstrap', asyncHandler(async (_req, res) => {
   const [userCount, snapshot] = await Promise.all([User.countDocuments(), getSnapshot()])
   res.json({ registrationAvailable: userCount === 0, language: snapshot.settings.language === 'ur' ? 'ur' : 'en' })
@@ -48,7 +53,7 @@ authRouter.post('/register', asyncHandler(async (req, res) => {
 authRouter.post('/login', asyncHandler(async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase()
   const password = String(req.body?.password || '')
-  const user = await User.findOne({ email })
+  const user = await User.findOne({ email: exactEmailMatch(email) })
   if (!user || !user.active || !(await bcrypt.compare(password, user.passwordHash))) {
     const error = new Error('Email or password is incorrect.')
     error.status = 401
