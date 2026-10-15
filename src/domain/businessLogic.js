@@ -451,6 +451,11 @@ export function saveDailyRecord(database, input, actor = null) {
   }
   const amount = amountOf(input.amount)
   const existing = database.dailyClosings.find((entry) => entry.date === date && entry.type === type && recordMatchesBranch(entry, branchId))
+  if (type === 'opening' && existing && actor && actor.role !== 'admin' && actor.permissions?.admin !== true) {
+    const error = new Error('Only an administrator can edit a saved daily opening.')
+    error.status = 403
+    throw error
+  }
   const counted = input.counted == null ? existing?.counted ?? null : amountOf(input.counted)
   const changed = Boolean(existing && (Number(existing.amount) !== amount || Number(existing.counted ?? existing.amount) !== Number(counted ?? amount) || String(existing.note || '') !== String(input.note || '')))
   if (existing?.finalized && changed && !String(input.correctionReason || '').trim()) throw new Error('Enter a correction reason to update a finalized daily record.')

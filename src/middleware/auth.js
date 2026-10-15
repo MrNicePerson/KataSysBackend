@@ -48,12 +48,19 @@ export function requirePermission(permission, actionOverride = null) {
       if (req.method === 'GET') action = 'view'
       else if (req.method === 'POST' && req.body?.type) {
         const recordType = req.body.type === 'opening' ? 'Opening' : 'Closing'
-        const existing = req.database?.dailyClosings?.some((entry) => entry.date === req.body.date && entry.type === req.body.type)
+        const existing = req.database?.dailyClosings?.some((entry) => entry.date === req.body.date
+          && entry.type === req.body.type
+          && String(entry.branchId || 'default') === String(req.body.branchId || 'default'))
         action = `daily${recordType}${existing ? 'Edit' : 'Create'}`
       } else if (req.method === 'DELETE') action = 'closingApprove'
     } else if (permission === 'finance' && path.startsWith('/banks')) {
       module = 'dailyClosing'
       action = path.includes('/transactions') ? 'withdrawals' : 'bankBalances'
+    }
+    if (module === 'dailyClosing' && action === 'dailyOpeningEdit' && req.user.role !== 'admin' && req.user.permissions?.admin !== true) {
+      const error = new Error('Only an administrator can edit a saved daily opening.')
+      error.status = 403
+      return next(error)
     }
     if (hasPermission(req.user, module, action)) return next()
     const error = new Error('You do not have permission for this action.')

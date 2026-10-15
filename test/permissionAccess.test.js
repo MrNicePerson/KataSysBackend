@@ -2,6 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { hasAnyModulePermission, hasPermission, normalizePermissions } from '../src/models/User.js'
 
+process.env.NODE_ENV ||= 'test'
+process.env.MONGODB_URI ||= 'mongodb://127.0.0.1:27017/katasys-permission-tests'
+process.env.JWT_SECRET ||= 'katasys-permission-tests-only-secret'
+const { requirePermission } = await import('../src/middleware/auth.js')
+
 test('legacy finance permission preserves daily closing view access', () => {
   const user = { role: 'staff', permissions: { finance: true } }
   assert.equal(hasPermission(user, 'dailyClosing', 'view'), true)
@@ -36,4 +41,33 @@ test('staff normalization cannot grant admin and derives legacy daily closing ac
 
 test('administrators retain full module access regardless of granular flags', () => {
   assert.equal(hasPermission({ role: 'admin', permissions: { salesDelete: false } }, 'sales', 'delete'), true)
+})
+
+test('saved opening edits are rejected for staff at the finance API permission layer', () => {
+  const request = {
+    user: { role: 'staff', permissions: { finance: true, dailyOpeningEdit: true } },
+    path: '/daily-closing',
+    baseUrl: '/finance',
+    method: 'POST',
+    body: { type: 'opening', date: '2026-10-15', branchId: 'default' },
+    database: { dailyClosings: [{ id: 'opening-1', date: '2026-10-15', type: 'opening', branchId: 'default' }] },
+  }
+  let error
+  requirePermission('finance')(request, {}, (nextError) => { error = nextError })
+  assert.equal(error?.status, 403)
+  assert.match(error?.message || '', /Only an administrator/)
+})
+
+test('staff may still create a daily opening when granted create permission', () => {
+  const request = {
+    user: { role: 'staff', permissions: { dailyOpeningCreate: true } },
+    path: '/daily-closing',
+    baseUrl: '/finance',
+    method: 'POST',
+    body: { type: 'opening', date: '2026-10-15', branchId: 'default' },
+    database: { dailyClosings: [] },
+  }
+  let error = 'next not called'
+  requirePermission('finance')(request, {}, (nextError) => { error = nextError })
+  assert.equal(error, undefined)
 })

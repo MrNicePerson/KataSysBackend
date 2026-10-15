@@ -55,6 +55,19 @@ test('finalized daily cash closing corrections require a reason and retain the p
   assert.equal(database.dailyClosings.find((entry) => entry.type === 'closing').correctionHistory[0].previous.counted, 118)
 })
 
+test('saved daily opening edits are restricted to administrators', () => {
+  const admin = { _id: 'admin-1', name: 'Admin', role: 'admin' }
+  const staff = { _id: 'staff-1', name: 'Staff', role: 'staff', permissions: { dailyOpeningEdit: true } }
+  const opened = saveDailyRecord(createEmptyDatabase(), { type: 'opening', date: '2026-10-09', amount: 100 }, admin).database
+
+  assert.throws(
+    () => saveDailyRecord(opened, { type: 'opening', date: '2026-10-09', amount: 150 }, staff),
+    (error) => error.status === 403 && /Only an administrator/.test(error.message),
+  )
+  const corrected = saveDailyRecord(opened, { type: 'opening', date: '2026-10-09', amount: 150 }, admin)
+  assert.equal(corrected.record.amount, 150)
+})
+
 test('cheque rescheduling and status changes append actor-attributed history', () => {
   let database = createEmptyDatabase()
   database.customers.push({ id: 'customer-1', name: 'Retailer', balance: 500 })
