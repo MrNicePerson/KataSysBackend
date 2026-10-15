@@ -177,6 +177,32 @@ test('editing bill quantities and rates reconciles stock, balance and movements 
   assert.throws(() => runDatabaseCommand(returned, 'update-sale-bill', { saleId: created.record.id, items: [{ lineId, quantity: 3, price: 12 }], discount: 0 }), /linked to returns/)
 })
 
+test('editing a split sale payment updates its receipt, ledger entries and pending cheque', () => {
+  const created = createSale(databaseFixture(), { customerId: 'customer-1', date: '2026-10-03', items: [{ productId: 'product-1', quantity: 4, price: 10 }], payments: { cash: 5 } })
+  const lineId = created.record.items[0].lineId
+  const changed = runDatabaseCommand(created.database, 'update-sale-bill', {
+    saleId: created.record.id,
+    items: [{ lineId, quantity: 4, price: 10 }],
+    discount: 0,
+    payments: { cash: 10, bank: 10, cheque: 15 },
+    bankDetails: { bankName: 'Example Bank', accountNumber: '123' },
+    cheque: { chequeNumber: 'CHQ-9', bankName: 'Cheque Bank', chequeDate: '2026-10-03', dueDate: '2026-10-15' },
+  })
+  assert.deepEqual(changed.record.payments, { cash: 10, bank: 10, cheque: 15 })
+  assert.equal(changed.record.paid, 20)
+  assert.equal(changed.record.due, 20)
+  assert.equal(changed.database.payments.find((entry) => entry.method === 'cash' && entry.referenceId === created.record.id).amount, 10)
+  assert.equal(changed.database.payments.find((entry) => entry.method === 'bank' && entry.referenceId === created.record.id).amount, 10)
+  const cheque = changed.database.cheques.find((entry) => entry.sourceType === 'sale' && entry.referenceId === created.record.id)
+  assert.equal(cheque.amount, 15)
+  assert.equal(cheque.number, 'CHQ-9')
+  assert.equal(cheque.bank, 'Cheque Bank')
+  assert.equal(buildThermalInvoice(changed.database, created.record.id).cheques[0].amount, 15)
+  assert.equal(changed.database.customers[0].balance, created.database.customers[0].balance - 15)
+  const cleared = updateChequeStatus(changed.database, cheque.id, 'Cleared')
+  assert.equal(cleared.database.customers[0].balance, changed.database.customers[0].balance - 15)
+})
+
 test('supplier codes are normalized, unique, and safely editable', () => {
   const database = databaseFixture()
   const first = runDatabaseCommand(database, 'create-supplier', { name: 'Ali Imran', supplierCode: ' aa ', openingBalance: 0 })
