@@ -1438,7 +1438,18 @@ export function updateSaleBill(database, input) {
     if (Number(product.stockQuantity || 0) + (oldByProduct.get(productId) || 0) - Number(product.reservedQuantity || 0) < quantity) throw new Error(`Not enough available stock for ${product.name}.`)
   }
   const products = database.products.map((product) => ({ ...product, stockQuantity: Number(product.stockQuantity || 0) + (oldByProduct.get(product.id) || 0) - (newByProduct.get(product.id) || 0) }))
-  const updated = { ...sale, items, subtotal, discount, total, due, status: due > 0 ? 'credit' : 'paid' }
+  const updated = {
+    ...sale,
+    items,
+    subtotal,
+    discount,
+    total,
+    due,
+    status: due > 0 ? 'credit' : 'paid',
+    padInvoiceNumber: input.padInvoiceNumber == null ? sale.padInvoiceNumber || '' : String(input.padInvoiceNumber).trim(),
+    customerPhone: input.customerPhone == null ? sale.customerPhone || '' : String(input.customerPhone).trim(),
+    customerAddress: input.customerAddress == null ? sale.customerAddress || '' : String(input.customerAddress).trim(),
+  }
   const movementByLine = new Map(originalItems.map((item, index) => [item.lineId, movements[index]]))
   const retainedMovements = database.stockMovements.filter((movement) => movement.type !== 'sale' || movement.referenceId !== sale.id)
   const updatedMovements = items.map((item) => {
