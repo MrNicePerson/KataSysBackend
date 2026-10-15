@@ -31,6 +31,7 @@ salesRouter.get('/:id', (req, res) => {
 })
 
 salesRouter.get('/:id/invoice', (req, res) => {
+  res.set('Cache-Control', 'no-store, max-age=0')
   send(res, buildThermalInvoice(req.database, req.params.id))
 })
 

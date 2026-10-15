@@ -188,7 +188,15 @@ test('editing a split sale payment updates its receipt, ledger entries and pendi
     bankDetails: { bankName: 'Example Bank', accountNumber: '123' },
     cheque: { chequeNumber: 'CHQ-9', bankName: 'Cheque Bank', chequeDate: '2026-10-03', dueDate: '2026-10-15' },
   })
-  assert.deepEqual(changed.record.payments, { cash: 10, bank: 10, cheque: 15 })
+  assert.deepEqual(changed.record.payments, {
+    cash: 10,
+    bank: 10,
+    cheque: 15,
+    chequeDetails: {
+      chequeNumber: 'CHQ-9', bankName: 'Cheque Bank', chequeDate: '2026-10-03', dueDate: '2026-10-15',
+      amount: 15, status: 'Pending',
+    },
+  })
   assert.equal(changed.record.paid, 20)
   assert.equal(changed.record.due, 20)
   assert.equal(changed.database.payments.find((entry) => entry.method === 'cash' && entry.referenceId === created.record.id).amount, 10)
@@ -198,6 +206,8 @@ test('editing a split sale payment updates its receipt, ledger entries and pendi
   assert.equal(cheque.number, 'CHQ-9')
   assert.equal(cheque.bank, 'Cheque Bank')
   assert.equal(buildThermalInvoice(changed.database, created.record.id).cheques[0].amount, 15)
+  assert.equal(buildThermalInvoice(changed.database, created.record.id).sale.payments.chequeDetails.chequeNumber, 'CHQ-9')
+  assert.equal(buildThermalInvoice(changed.database, created.record.id).sale.payments.chequeDetails.amount, 15)
   assert.equal(changed.database.customers[0].balance, created.database.customers[0].balance - 15)
   const cleared = updateChequeStatus(changed.database, cheque.id, 'Cleared')
   assert.equal(cleared.database.customers[0].balance, changed.database.customers[0].balance - 15)
