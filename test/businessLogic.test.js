@@ -22,6 +22,7 @@ import {
   buildThermalInvoice,
   calculateAccountLedger,
   calculateDailyClosing,
+  saleDayStatus,
 } from '../src/domain/businessLogic.js'
 
 function databaseFixture() {
@@ -45,6 +46,36 @@ function databaseFixture() {
   }]
   return database
 }
+
+test('sale commands require opening, reject a closed day, and isolate branches', () => {
+  const date = '2026-10-15'
+  const input = { items: [{ productId: 'product-1', quantity: 1, price: 10 }], payments: { cash: 10 } }
+  const context = { businessDate: date, branchId: 'north' }
+  const empty = databaseFixture()
+  assert.throws(() => runDatabaseCommand(empty, 'create-sale', input, context), /Daily Opening is required/)
+
+  const otherBranch = runDatabaseCommand(empty, 'daily-record', { type: 'opening', date, amount: 0 }, { businessDate: date, branchId: 'south' }).database
+  assert.throws(() => runDatabaseCommand(otherBranch, 'create-sale', input, context), /Daily Opening is required/)
+
+  const opened = runDatabaseCommand(otherBranch, 'daily-record', { type: 'opening', date, amount: 0 }, context).database
+  const sold = runDatabaseCommand(opened, 'create-sale', input, context)
+  assert.equal(sold.record.date, date)
+  assert.equal(sold.record.branchId, 'north')
+
+  const closed = runDatabaseCommand(sold.database, 'daily-record', { type: 'closing', date, amount: 10, counted: 10 }, context).database
+  assert.throws(() => runDatabaseCommand(closed, 'create-sale', input, context), /Daily Closing has already been completed/)
+  assert.equal(saleDayStatus(closed, context).canCreateSale, false)
+  assert.equal(saleDayStatus(closed, { date: '2026-10-16', branchId: 'north' }).canCreateSale, false)
+})
+
+test('repeated opening writes remain one record under the serialized command model', () => {
+  const date = '2026-10-15'
+  const context = { businessDate: date, branchId: 'north' }
+  const first = runDatabaseCommand(databaseFixture(), 'daily-record', { type: 'opening', date, amount: 100 }, context)
+  const second = runDatabaseCommand(first.database, 'daily-record', { type: 'opening', date, amount: 120 }, context)
+  assert.equal(second.database.dailyClosings.filter((entry) => entry.date === date && entry.type === 'opening' && entry.branchId === 'north').length, 1)
+  assert.equal(second.record.amount, 120)
+})
 
 test('Recovery All uses existing cash payments, customer ledgers and daily cash for multiple accounts', () => {
   const database = databaseFixture()

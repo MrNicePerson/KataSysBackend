@@ -76,3 +76,25 @@ test('cheque rescheduling and status changes append actor-attributed history', (
   assert.equal(cheque.statusHistory.length, 4)
   assert.equal(database.payments.length, 2)
 })
+
+test('daily closing API calculation exposes every payment and expense channel', () => {
+  const database = createEmptyDatabase()
+  database.dailyClosings = [{ id: 'open', date: '2026-10-14', type: 'opening', amount: 500 }]
+  database.sales = [
+    { id: 'modern', date: '2026-10-14', total: 200, payments: { cash: 50, bank: 75, cheque: 25, credit: 50 } },
+    { id: 'legacy', date: '2026-10-14', total: 40 },
+  ]
+  database.payments = [{ id: 'legacy-cash', date: '2026-10-14', type: 'customer-payment', method: 'cash', amount: 40, referenceId: 'legacy' }]
+  database.expenses = [
+    { date: '2026-10-14', method: 'cash', amount: 10 },
+    { date: '2026-10-14', method: 'bank', amount: 20 },
+    { date: '2026-10-14', method: 'cheque', amount: 30 },
+  ]
+  const result = calculateDailyClosing(database, '2026-10-14')
+  assert.equal(result.cashSales, 90)
+  assert.equal(result.bankSales, 75)
+  assert.equal(result.chequeSales, 25)
+  assert.equal(result.creditSales, 90)
+  assert.equal(result.expenseTotal, 60)
+  assert.equal(result.expectedCash, 580)
+})

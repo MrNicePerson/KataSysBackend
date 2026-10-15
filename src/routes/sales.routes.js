@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { buildThermalInvoice, nextDocumentNumber, searchSales } from '../domain/businessLogic.js'
+import { buildThermalInvoice, businessDateString, nextDocumentNumber, normalizeBranchId, saleDayStatus, searchSales } from '../domain/businessLogic.js'
 import { requirePermission } from '../middleware/auth.js'
 import { mutate, readSnapshot, send } from './helpers.js'
 
@@ -17,6 +17,11 @@ salesRouter.get('/', (req, res) => {
 
 salesRouter.get('/next-number', (req, res) => {
   send(res, { number: nextDocumentNumber(req.database, 'sale', 'INV') })
+})
+
+salesRouter.get('/day-status', (req, res) => {
+  const branchId = normalizeBranchId(req.user?.branchId || req.database.business?.branchId)
+  send(res, saleDayStatus(req.database, { date: businessDateString(), branchId }))
 })
 
 salesRouter.get('/:id', (req, res) => {

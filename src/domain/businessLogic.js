@@ -35,6 +35,31 @@ export function createEmptyDatabase() {
 
 const now = () => new Date().toISOString()
 export const localDateString = (date = new Date()) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+export const businessDateString = (date = new Date(), timeZone = process.env.BUSINESS_TIMEZONE || 'Asia/Karachi') => {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(date)
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  return `${values.year}-${values.month}-${values.day}`
+}
+export const DEFAULT_BRANCH_ID = 'default'
+export const normalizeBranchId = (value) => String(value || DEFAULT_BRANCH_ID)
+const recordMatchesBranch = (entry, branchId) => normalizeBranchId(entry?.branchId) === normalizeBranchId(branchId)
+export function saleDayStatus(database, { date = businessDateString(), branchId = DEFAULT_BRANCH_ID } = {}) {
+  const normalizedBranchId = normalizeBranchId(branchId)
+  const records = database.dailyClosings || []
+  const openingCompleted = records.some((entry) => entry.date === date && entry.type === 'opening' && recordMatchesBranch(entry, normalizedBranchId))
+  const closingCompleted = records.some((entry) => entry.date === date && entry.type === 'closing' && recordMatchesBranch(entry, normalizedBranchId))
+  const reason = !openingCompleted
+    ? "Daily Opening is required before creating a new sale. Please complete today's opening first."
+    : closingCompleted
+      ? 'Daily Closing has already been completed for this business date. New sales are not allowed.'
+      : ''
+  return { date, branchId: normalizedBranchId, openingCompleted, closingCompleted, canCreateSale: !reason, reason }
+}
+export function assertSaleDayOpen(database, context = {}) {
+  const status = saleDayStatus(database, context)
+  if (!status.canCreateSale) throw new Error(status.reason)
+  return status
+}
 const dateOf = (value) => value || localDateString()
 const amountOf = (value) => {
   const amount = Number(value)
@@ -158,6 +183,7 @@ export function createSale(database, input) {
   const sale = record('sale', {
     number: input.number || `INV-${String((database.counters?.sale || 0) + 1).padStart(4, '0')}`,
     date: dateOf(input.date),
+    branchId: normalizeBranchId(input.branchId),
     customerId: input.customerId || null,
     customer: input.customer || database.customers.find((entry) => entry.id === input.customerId)?.name || '',
     customerDetails: input.customerDetails || null,
@@ -409,7 +435,8 @@ export function recordStockCountAudit(database, input) {
 export function saveDailyRecord(database, input, actor = null) {
   const date = dateOf(input.date)
   const type = input.type === 'opening' ? 'opening' : 'closing'
-  if (type === 'closing' && !database.dailyClosings.some((entry) => entry.date === date && entry.type === 'opening')) {
+  const branchId = normalizeBranchId(input.branchId)
+  if (type === 'closing' && !database.dailyClosings.some((entry) => entry.date === date && entry.type === 'opening' && recordMatchesBranch(entry, branchId))) {
     throw new Error('Save the daily opening before recording the daily closing.')
   }
   const [year, month, day] = date.split('-').map(Number)
@@ -423,7 +450,7 @@ export function saveDailyRecord(database, input, actor = null) {
     throw new Error('Complete the monthly stock audit before saving this month-end closing.')
   }
   const amount = amountOf(input.amount)
-  const existing = database.dailyClosings.find((entry) => entry.date === date && entry.type === type)
+  const existing = database.dailyClosings.find((entry) => entry.date === date && entry.type === type && recordMatchesBranch(entry, branchId))
   const counted = input.counted == null ? existing?.counted ?? null : amountOf(input.counted)
   const changed = Boolean(existing && (Number(existing.amount) !== amount || Number(existing.counted ?? existing.amount) !== Number(counted ?? amount) || String(existing.note || '') !== String(input.note || '')))
   if (existing?.finalized && changed && !String(input.correctionReason || '').trim()) throw new Error('Enter a correction reason to update a finalized daily record.')
@@ -437,7 +464,7 @@ export function saveDailyRecord(database, input, actor = null) {
   } : null
   const dailyRecord = existing
     ? { ...existing, amount, counted, note: input.note || '', updatedAt: now(), updatedById: String(actor?._id || ''), updatedByName: actor?.name || '', ...(correction ? { correctionHistory: [...(existing.correctionHistory || []), correction] } : {}) }
-    : record('daily', { date, type, amount, counted, note: input.note || '', ...(type === 'closing' && actor ? { finalized: true, closedAt: now(), closedById: String(actor._id), closedByName: actor.name || '' } : {}) })
+    : record('daily', { date, branchId, type, amount, counted, note: input.note || '', ...(type === 'closing' && actor ? { finalized: true, closedAt: now(), closedById: String(actor._id), closedByName: actor.name || '' } : {}) })
   const dailyClosings = existing ? database.dailyClosings.map((entry) => entry.id === existing.id ? dailyRecord : entry) : [dailyRecord, ...database.dailyClosings]
   const description = correction ? `Daily ${type} corrected for ${date}: ${correction.reason}` : `Daily ${type} saved for ${date}`
   const next = { ...database, dailyClosings, auditHistory: addAudit(database, correction ? `daily-${type}-corrected` : `daily-${type}`, dailyRecord.id, description) }
@@ -448,7 +475,7 @@ export function deleteDailyRecord(database, recordId) {
   const existing = database.dailyClosings.find((entry) => entry.id === recordId)
   if (!existing) throw new Error('Daily record could not be found.')
   if (existing.finalized) throw new Error('A finalized daily closing cannot be deleted. Record a correction with an audit reason instead.')
-  if (existing.type === 'opening' && database.dailyClosings.some((entry) => entry.date === existing.date && entry.type === 'closing')) {
+  if (existing.type === 'opening' && database.dailyClosings.some((entry) => entry.date === existing.date && entry.type === 'closing' && recordMatchesBranch(entry, existing.branchId))) {
     throw new Error('Delete the daily closing before deleting its opening.')
   }
   const next = {
@@ -519,8 +546,13 @@ export function updateClaimStatus(database, claimId, status, resolution = '') {
 }
 
 export function runDatabaseCommand(database, command, input = {}, context = {}) {
+  const branchId = normalizeBranchId(context.branchId || context.actor?.branchId || database.business?.branchId)
+  const businessDate = context.businessDate || businessDateString()
   switch (command) {
-    case 'create-sale': return createSale(database, input)
+    case 'create-sale': {
+      assertSaleDayOpen(database, { date: businessDate, branchId })
+      return createSale(database, { ...input, date: businessDate, branchId })
+    }
     case 'receive-purchase': return receivePurchase(database, input)
     case 'customer-return': return processCustomerReturn(database, input)
     case 'supplier-return': return processSupplierReturn(database, input)
@@ -536,7 +568,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'create-product': return createProduct(database, input)
     case 'adjust-stock': return adjustStock(database, input)
     case 'stock-audit': return recordStockCountAudit(database, input)
-    case 'daily-record': return saveDailyRecord(database, input, context.actor)
+    case 'daily-record': return saveDailyRecord(database, { ...input, branchId }, context.actor)
     case 'delete-daily-record': return deleteDailyRecord(database, input.recordId)
     case 'create-bank-account': return createBankAccount(database, input, context.actor)
     case 'update-bank-account': return updateBankAccount(database, input, context.actor)
@@ -547,8 +579,14 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'claim-status': return updateClaimStatus(database, input.claimId, input.status, input.resolution)
     case 'claim-update': return updateClaimDetails(database, input)
     case 'create-cheque': return createManualCheque(database, input, context.actor)
-    case 'partial-deliver-held-order': return partialDeliverHeldOrder(database, input)
-    case 'complete-held-order': return completeHeldOrder(database, input)
+    case 'partial-deliver-held-order': {
+      assertSaleDayOpen(database, { date: businessDate, branchId })
+      return partialDeliverHeldOrder(database, { ...input, date: businessDate, branchId })
+    }
+    case 'complete-held-order': {
+      assertSaleDayOpen(database, { date: businessDate, branchId })
+      return completeHeldOrder(database, { ...input, date: businessDate, branchId })
+    }
     case 'finance': return recordFinanceEntry(database, input)
     case 'bulk-recovery': return bulkAccountRecovery(database, input)
     case 'create-installment': return createInstallmentPlan(database, input)
@@ -759,20 +797,34 @@ function legacyHeldItemMatches(products, item, product) {
 }
 
 export function calculateDailyClosing(database, date) {
-  const sameDate = (entry) => entry.date === date
+  const dateOnly = (value) => String(value || '').slice(0, 10)
+  const sameDate = (entry) => dateOnly(entry.date) === date
   const opening = database.dailyClosings.find((entry) => entry.type === 'opening' && sameDate(entry))?.amount || 0
   const sumPayment = (predicate) => database.payments.filter((entry) => sameDate(entry) && predicate(entry)).reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
-  const cashSales = sumPayment((entry) => entry.type === 'customer-payment' && entry.method === 'cash' && database.sales.some((sale) => sale.id === entry.referenceId))
+  const salesOnDate = database.sales.filter((sale) => dateOnly(sale.date) === date)
+  const salePaymentTotal = (method) => salesOnDate.reduce((sum, sale) => {
+    const payments = sale.payments || {}
+    return sum + (method === 'bank' ? Number(payments.bank ?? payments.bankTransfer ?? 0) : Number(payments[method] || 0))
+  }, 0)
+  const linkedSalePaymentTotal = (method) => sumPayment((entry) => entry.type === 'customer-payment' && entry.method === method && salesOnDate.some((sale) => sale.id === entry.referenceId && !sale.payments))
+  const cashSales = salePaymentTotal('cash') + linkedSalePaymentTotal('cash')
+  const bankSales = salePaymentTotal('bank') + linkedSalePaymentTotal('bank')
+  const chequeSales = salePaymentTotal('cheque') + linkedSalePaymentTotal('cheque')
+  const creditSales = salesOnDate.reduce((sum, sale) => sum + Number(sale.payments?.credit ?? sale.payments?.khata ?? Math.max(0, Number(sale.total || 0) - Number(sale.payments?.cash || 0) - Number(sale.payments?.bank || sale.payments?.bankTransfer || 0) - Number(sale.payments?.cheque || 0))), 0)
   const customerPayments = sumPayment((entry) => entry.type === 'customer-payment' && entry.method === 'cash' && !database.sales.some((sale) => sale.id === entry.referenceId))
   const supplierPayments = sumPayment((entry) => entry.type === 'supplier-payment' && entry.method === 'cash')
-  const cashExpenses = database.expenses.filter((entry) => sameDate(entry) && entry.method === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  const expensesOnDate = database.expenses.filter(sameDate)
+  const expenseTotal = expensesOnDate.reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  const cashExpenses = expensesOnDate.filter((entry) => entry.method === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  const bankExpenses = expensesOnDate.filter((entry) => entry.method === 'bank').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  const chequeExpenses = expensesOnDate.filter((entry) => entry.method === 'cheque').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const cashRefunds = sumPayment((entry) => entry.type === 'customer-refund' && entry.method === 'cash')
   const cashOtherReceipts = (database.financeEntries || []).filter((entry) => sameDate(entry) && entry.type === 'capital' && entry.method === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const bankTransactions = (database.bankTransactions || []).filter((entry) => sameDate(entry))
   const cashWithdrawals = bankTransactions.filter((entry) => entry.type === 'withdrawal' && entry.destination === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const cashDeposits = bankTransactions.filter((entry) => entry.type === 'deposit' && entry.source === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const expectedCash = money(opening + cashSales + customerPayments + cashOtherReceipts + cashWithdrawals - supplierPayments - cashExpenses - cashRefunds - cashDeposits)
-  return { date, opening, cashSales, customerPayments, cashOtherReceipts, supplierPayments, cashExpenses, cashRefunds, cashWithdrawals, cashDeposits, expectedCash }
+  return { date, opening, cashSales, bankSales, chequeSales, creditSales, customerPayments, cashOtherReceipts, supplierPayments, expenseTotal, cashExpenses, bankExpenses, chequeExpenses, cashRefunds, cashWithdrawals, cashDeposits, expectedCash }
 }
 
 export function calculateBankBalanceSummary(database, date) {
