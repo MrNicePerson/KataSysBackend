@@ -133,7 +133,7 @@ function validateSplits(total, payments) {
   return { cash, bank, cheque, credit: Math.max(0, total - cash - bank) }
 }
 
-export function createSale(database, input) {
+export function createSale(database, input, { actor = null } = {}) {
   if (!Array.isArray(input.items) || input.items.length === 0) throw new Error('Add at least one item before saving the sale.')
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   const idempotencyFingerprint = idempotencyKey ? JSON.stringify({
@@ -248,16 +248,43 @@ export function createSale(database, input) {
   let stockMovements = database.stockMovements
   for (const item of saleItems) stockMovements = addMovement({ ...database, stockMovements }, { productId: item.productId, type: 'sale', quantity: -item.quantity, referenceId: sale.id, date: sale.date, note: sale.number || 'Sale' })
   let returnRecords = []
+  let claims = database.claims
   for (const item of returnItems) {
     const returnRecord = record('return', { saleId: item.originalSale.id, saleNumber: item.originalSale.number, adjustmentSaleId: sale.id, customerId: item.originalSale.customerId, productId: item.originalItem.productId, lineId: item.originalItem.lineId, code: item.originalItem.code, itemName: item.originalItem.name, quantity: item.quantity, unitPrice: item.amount / item.quantity, amount: item.amount, condition: item.condition, refundType: refundDue > 0 ? refundType : 'sale-adjustment', date: sale.date })
     returnRecords.push(returnRecord)
     stockMovements = addMovement({ ...database, stockMovements }, { productId: item.originalItem.productId, type: item.condition === 'sellable' ? 'customer-return' : 'customer-return-defective', quantity: item.quantity, referenceId: returnRecord.id, date: sale.date, note: item.originalSale.number })
+    if (item.condition === 'damaged') {
+      const product = database.products.find((entry) => entry.id === item.originalItem.productId)
+      const claim = record('claim', {
+        productId: item.originalItem.productId,
+        productName: item.originalItem.name,
+        quantity: item.quantity,
+        amount: 0,
+        description: `Defective product returned by customer on sale ${item.originalSale.number || item.originalSale.id}`,
+        date: sale.date,
+        status: 'Pending',
+        physicalStatus: 'quarantine',
+        financialStatus: 'not-applicable',
+        sourceType: 'customer-return',
+        sourceReturnId: returnRecord.id,
+        sourceSaleId: item.originalSale.id,
+        saleNumber: item.originalSale.number || '',
+        customerId: item.originalSale.customerId || null,
+        customer: item.originalSale.customer || '',
+        supplierId: product?.supplierId || null,
+        supplier: database.suppliers.find((entry) => entry.id === product?.supplierId)?.name || '',
+        inventoryManagedBySource: true,
+        createdById: String(actor?._id || actor?.id || ''),
+        createdByName: actor?.name || '',
+      })
+      claims = [claim, ...claims]
+    }
   }
   let customers = database.customers
   if (sale.customerId && (split.credit > 0 || refundType === 'khata' && refundDue > 0)) {
     customers = updateBalance(customers, sale.customerId, split.credit - (refundType === 'khata' ? refundDue : 0))
   }
-  let next = { ...database, products, customers, sales: [sale, ...database.sales], returns: [...returnRecords, ...database.returns], stockMovements }
+  let next = { ...database, products, customers, sales: [sale, ...database.sales], returns: [...returnRecords, ...database.returns], claims, stockMovements }
   if (split.cash > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'cash', amount: split.cash, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
   if (refundDue > 0 && refundType === 'cash') next = { ...next, payments: addPayment(next, { type: 'customer-refund', method: 'cash', amount: refundDue, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
   if (split.bank > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'bank', amount: split.bank, bankDetails, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
@@ -267,6 +294,35 @@ export function createSale(database, input) {
 }
 
 export function receivePurchase(database, input) {
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const idempotencyFingerprint = idempotencyKey ? JSON.stringify({
+    supplierId: input.supplierId,
+    date: dateOf(input.date ?? input.arrivalDate),
+    padNumber: String(input.padNumber ?? '').trim(),
+    items: (input.items || []).map((item) => ({
+      productId: item.productId || null,
+      existingProductId: item.existingProductId || null,
+      productName: item.productName ?? item.name ?? '',
+      code: item.code ?? item.articleNumber ?? '',
+      padNumber: item.padNumber ?? '',
+      size: item.size ?? '',
+      quantity: item.quantity,
+      unitCost: item.unitCost ?? item.cost ?? 0,
+      salePrice: item.salePrice ?? 0,
+      season: item.season || '',
+      rackLocation: item.rackLocation ?? item.location ?? '',
+    })),
+    payments: input.payments || {},
+    bankDetails: input.bankDetails || null,
+    cheques: input.cheques || [],
+  }) : ''
+  if (idempotencyKey) {
+    const existing = database.purchases.find((entry) => entry.idempotencyKey === idempotencyKey)
+    if (existing) {
+      if (existing.idempotencyFingerprint !== idempotencyFingerprint) throw new Error('This receiving submission key was already used for different delivery details.')
+      return { database, record: existing }
+    }
+  }
   if (!input.supplierId) throw new Error('Choose a supplier before saving the purchase.')
   if (!Array.isArray(input.items) || input.items.length === 0) throw new Error('Add at least one stock item before saving the purchase.')
   const supplier = database.suppliers.find((entry) => entry.id === input.supplierId)
@@ -276,9 +332,11 @@ export function receivePurchase(database, input) {
   const purchaseItems = input.items.map((item) => ({
     lineId: item.lineId || makeId('purchase-line'),
     productId: item.productId || null,
+    existingProductId: item.existingProductId || null,
     productName: String(item.productName ?? item.name ?? item.code ?? item.articleNumber ?? '').trim(),
     code: String(item.code ?? item.articleNumber ?? '').trim(),
     batchNumber: generatedBatchNumber,
+    padNumber: String(item.padNumber ?? input.padNumber ?? '').trim(),
     size: String(item.size ?? '').trim(),
     season: String(item.season ?? '').trim(),
     rackLocation: String(item.rackLocation ?? item.location ?? '').trim(),
@@ -312,6 +370,7 @@ export function receivePurchase(database, input) {
     bankDetails = { bankName, accountNumber, amount: bank }
   }
   const purchase = record('purchase', {
+    ...(idempotencyKey ? { idempotencyKey, idempotencyFingerprint } : {}),
     batchNumber: generatedBatchNumber,
     supplierBillNumber,
     padNumber: String(input.padNumber ?? '').trim(),
@@ -333,15 +392,23 @@ export function receivePurchase(database, input) {
     const sameBatch = (entry) =>
       entry.supplierId === supplier.id &&
       String(entry.batchNumber || '').trim().toLowerCase() === item.batchNumber.toLowerCase()
-    const sourceProduct = item.productId ? products.find((entry) => entry.id === item.productId) : null
+    const reusesExistingProduct = Boolean(item.existingProductId)
+    const selectedExistingProduct = reusesExistingProduct ? products.find((entry) => entry.id === item.existingProductId) : null
+    if (reusesExistingProduct && !selectedExistingProduct) throw new Error('The selected existing stock product could not be found.')
+    if (selectedExistingProduct?.supplierId && selectedExistingProduct.supplierId !== supplier.id) throw new Error('Choose an existing product belonging to the selected supplier.')
+    const sourceProduct = (item.productId || item.existingProductId)
+      ? products.find((entry) => entry.id === (item.productId || item.existingProductId))
+      : null
     if (sourceProduct) {
       item.productName ||= sourceProduct.name
       item.code ||= sourceProduct.code
       item.size ||= sourceProduct.size || ''
       item.rackLocation ||= sourceProduct.rackLocation || ''
     }
-    let product = item.productId
-      ? products.find((entry) => entry.id === item.productId && sameBatch(entry))
+    let product = reusesExistingProduct
+      ? selectedExistingProduct
+      : item.productId
+        ? products.find((entry) => entry.id === item.productId && sameBatch(entry))
       : products.find((entry) => item.code && entry.code?.toLowerCase() === item.code.toLowerCase() && sameBatch(entry))
     if (!product && item.productName) product = products.find((entry) => entry.name.toLowerCase() === item.productName.toLowerCase() && sameBatch(entry))
     if (product) {
@@ -351,22 +418,20 @@ export function receivePurchase(database, input) {
         stockQuantity: Number(entry.stockQuantity || 0) + item.quantity,
         averageCost: ((Number(entry.stockQuantity || 0) * Number(entry.averageCost || 0)) + (item.quantity * item.unitCost)) / (Number(entry.stockQuantity || 0) + item.quantity || 1),
         salePrice: item.salePrice || Number(entry.salePrice || 0),
-        supplierId: supplier.id,
-        batchNumber: purchase.batchNumber,
-        purchaseId: purchase.id,
-        arrivalDate: purchase.date,
+        ...(!entry.supplierId ? { supplierId: supplier.id } : {}),
+        ...(!reusesExistingProduct && !item.productId ? { batchNumber: purchase.batchNumber, purchaseId: purchase.id, arrivalDate: purchase.date } : {}),
         size: item.size || entry.size || '',
         season: item.season || entry.season || '',
         rackLocation: item.rackLocation || entry.rackLocation,
       } : entry)
-      stockMovements = addMovement({ ...database, stockMovements }, { productId: product.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: purchase.batchNumber })
+      stockMovements = addMovement({ ...database, stockMovements }, { productId: product.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: item.batchNumber })
     } else {
       const newProduct = record('product', { name: item.productName, code: item.code || makeId('sku'), categoryId: null, size: item.size, season: item.season, stockQuantity: item.quantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: item.unitCost, salePrice: item.salePrice, supplierId: supplier.id, batchNumber: item.batchNumber, rackLocation: item.rackLocation, active: true })
       newProduct.purchaseId = purchase.id
       newProduct.arrivalDate = purchase.date
       products.push(newProduct)
       purchaseItems[purchaseItems.indexOf(item)] = { ...item, productId: newProduct.id }
-      stockMovements = addMovement({ ...database, stockMovements }, { productId: newProduct.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: purchase.batchNumber })
+      stockMovements = addMovement({ ...database, stockMovements }, { productId: newProduct.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: item.batchNumber })
     }
   }
   for (const item of purchaseItems) item.productName = item.productName || products.find((product) => product.id === item.productId)?.name || ''
@@ -377,13 +442,14 @@ export function receivePurchase(database, input) {
   if (cash > 0) next = { ...next, payments: addPayment(next, { type: 'supplier-payment', method: 'cash', amount: cash, supplierId: supplier.id, referenceId: purchase.id, date: purchase.date }) }
   if (bank > 0) next = { ...next, payments: addPayment(next, { type: 'supplier-payment', method: 'bank', amount: bank, bankDetails, supplierId: supplier.id, referenceId: purchase.id, date: purchase.date }) }
   if (cheque > 0) next = { ...next, payments: addPayment(next, { type: 'supplier-payment', method: 'cheque', amount: cheque, supplierId: supplier.id, referenceId: purchase.id, date: purchase.date }), cheques: [...chequeEntries.map((entry) => record('cheque', { direction: 'given', partyType: 'supplier', partyId: supplier.id, party: supplier.name, ...entry, referenceId: purchase.id, sourceType: 'purchase', appliedToBalance: true, status: 'Pending' })), ...next.cheques] }
-  next = { ...next, counters: { ...next.counters, supplierReceivings: { ...next.counters?.supplierReceivings, [supplier.id]: supplierBillNumber } }, auditHistory: addAudit(next, 'purchase', purchase.id, `Receive stock ${purchase.batchNumber} recorded`) }
+  next = { ...next,     counters: { ...next.counters, supplierReceivings: { ...next.counters?.supplierReceivings, [supplier.id]: supplierBillNumber } }, auditHistory: addAudit(next, 'purchase', purchase.id, `Receive stock ${purchase.batchNumber} recorded`) }
   return { database: next, record: purchase }
 }
 
 export function updatePurchase(database, input) {
   const purchase = database.purchases.find((entry) => entry.id === input.purchaseId)
   if (!purchase) throw new Error('Purchase could not be found.')
+  if (input.appendStock === true) return appendPurchaseItems(database, purchase, input)
   if (input.supplierId && input.supplierId !== purchase.supplierId) throw new Error('A received purchase cannot be moved to another supplier.')
   if (database.supplierReturns.some((entry) => entry.purchaseId === purchase.id)) throw new Error('This delivery has supplier returns and cannot be edited safely.')
   if (!Array.isArray(input.items) || input.items.length !== purchase.items.length) throw new Error('Keep the delivery item lines unchanged while editing this bill.')
@@ -490,7 +556,7 @@ export function updatePurchase(database, input) {
     quantity: item.quantity,
     referenceId: purchase.id,
     date,
-    note: purchase.batchNumber || purchase.id,
+    note: item.batchNumber || purchase.batchNumber || purchase.id,
   })
 
   let payments = database.payments.filter((entry) => !(entry.type === 'supplier-payment' && entry.referenceId === purchase.id))
@@ -536,6 +602,135 @@ export function updatePurchase(database, input) {
     cheques,
     stockMovements,
     auditHistory: addAudit(database, 'purchase-edit', purchase.id, `Receive stock ${purchase.batchNumber || purchase.id} updated`),
+  }
+  return { database: next, record: updatedPurchase }
+}
+
+function appendPurchaseItems(database, purchase, input) {
+  if (input.supplierId && input.supplierId !== purchase.supplierId) throw new Error('A received purchase cannot be moved to another supplier.')
+  if (database.supplierReturns.some((entry) => entry.purchaseId === purchase.id)) throw new Error('This delivery has supplier returns and cannot be edited safely.')
+  if (!Array.isArray(input.appendItems) || input.appendItems.length === 0) throw new Error('Add at least one new stock item before saving.')
+  const idempotencyKey = String(input.appendIdempotencyKey || '').trim()
+  if (!idempotencyKey) throw new Error('A delivery-item submission key is required.')
+  const fingerprint = JSON.stringify(input.appendItems.map((item) => ({
+    existingProductId: item.existingProductId || null,
+    productName: item.productName ?? item.name ?? '',
+    code: item.code ?? item.articleNumber ?? '',
+    padNumber: item.padNumber ?? '',
+    quantity: item.quantity,
+    unitCost: item.unitCost ?? item.cost ?? 0,
+    salePrice: item.salePrice ?? 0,
+    season: item.season || '',
+  })))
+  const previousOperation = (purchase.appendOperations || []).find((entry) => entry.idempotencyKey === idempotencyKey)
+  if (previousOperation) {
+    if (previousOperation.fingerprint !== fingerprint) throw new Error('This add-stock submission key was already used for different item details.')
+    return { database, record: purchase }
+  }
+  const supplier = database.suppliers.find((entry) => entry.id === purchase.supplierId)
+  if (!supplier) throw new Error('The delivery supplier could not be found.')
+  const date = purchase.date || dateOf(input.date)
+  const { batchNumber, supplierBillNumber } = nextReceivingBatch(database, supplier, date)
+  const items = input.appendItems.map((submitted) => {
+    const productName = String(submitted.productName ?? submitted.name ?? submitted.articleNumber ?? submitted.code ?? '').trim()
+    const code = String(submitted.code ?? submitted.articleNumber ?? '').trim()
+    if (!productName && !submitted.existingProductId) throw new Error('Each added stock item needs an article/design number or an existing product.')
+    return {
+      lineId: makeId('purchase-line'),
+      productId: null,
+      existingProductId: submitted.existingProductId || null,
+      productName,
+      code,
+      padNumber: String(submitted.padNumber ?? purchase.padNumber ?? '').trim(),
+      batchNumber,
+      size: String(submitted.size ?? '').trim(),
+      season: String(submitted.season ?? '').trim(),
+      rackLocation: String(submitted.rackLocation ?? submitted.location ?? '').trim(),
+      quantity: positiveQuantity(submitted.quantity),
+      unitCost: amountOf(submitted.unitCost ?? submitted.cost ?? 0),
+      salePrice: amountOf(submitted.salePrice ?? 0),
+    }
+  })
+  let products = [...database.products]
+  let stockMovements = [...database.stockMovements]
+  for (const item of items) {
+    let product = null
+    if (item.existingProductId) {
+      product = products.find((entry) => entry.id === item.existingProductId)
+      if (!product) throw new Error('The selected existing stock product could not be found.')
+      if (product.supplierId && product.supplierId !== supplier.id) throw new Error('Choose an existing product belonging to the delivery supplier.')
+      const previousQuantity = Number(product.stockQuantity || 0)
+      const nextQuantity = previousQuantity + item.quantity
+      item.productId = product.id
+      item.productName ||= product.name
+      item.code ||= product.code
+      products = products.map((entry) => entry.id === product.id ? {
+        ...entry,
+        stockQuantity: nextQuantity,
+        averageCost: ((previousQuantity * Number(entry.averageCost || 0)) + (item.quantity * item.unitCost)) / (nextQuantity || 1),
+        salePrice: item.salePrice || Number(entry.salePrice || 0),
+        season: item.season || entry.season || '',
+        ...(!entry.supplierId ? { supplierId: supplier.id } : {}),
+      } : entry)
+    } else {
+      product = record('product', {
+        name: item.productName,
+        code: item.code || makeId('sku'),
+        categoryId: null,
+        size: item.size,
+        season: item.season,
+        stockQuantity: item.quantity,
+        reservedQuantity: 0,
+        defectiveQuantity: 0,
+        averageCost: item.unitCost,
+        salePrice: item.salePrice,
+        supplierId: supplier.id,
+        batchNumber,
+        rackLocation: item.rackLocation,
+        active: true,
+        purchaseId: purchase.id,
+        arrivalDate: date,
+      })
+      item.productId = product.id
+      products.push(product)
+    }
+    stockMovements = addMovement({ ...database, stockMovements }, {
+      productId: item.productId,
+      type: 'purchase',
+      quantity: item.quantity,
+      referenceId: purchase.id,
+      date,
+      note: item.batchNumber,
+    })
+  }
+  const appendedCost = items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
+  const total = Number(purchase.total || 0) + appendedCost
+  const payments = purchase.payments || { cash: 0, bank: 0, cheque: 0 }
+  const paid = Number(purchase.paid ?? (Number(payments.cash || 0) + Number(payments.bank || payments.bankTransfer || 0) + Number(payments.cheque || 0)))
+  const due = Math.max(0, total - paid)
+  const updatedPurchase = {
+    ...purchase,
+    items: [...purchase.items, ...items],
+    total,
+    paid,
+    due,
+    appendOperations: [...(purchase.appendOperations || []), { idempotencyKey, fingerprint, batchNumber, itemIds: items.map((item) => item.lineId), createdAt: now() }],
+  }
+  const suppliers = updateBalance(database.suppliers, supplier.id, due - Number(purchase.due || 0))
+  const next = {
+    ...database,
+    products,
+    suppliers,
+    purchases: database.purchases.map((entry) => entry.id === purchase.id ? updatedPurchase : entry),
+    stockMovements,
+    counters: {
+      ...database.counters,
+      supplierReceivings: {
+        ...database.counters?.supplierReceivings,
+        [supplier.id]: Math.max(Number(database.counters?.supplierReceivings?.[supplier.id] || 0), supplierBillNumber),
+      },
+    },
+    auditHistory: addAudit(database, 'purchase-stock-addition', purchase.id, `Stock added to delivery ${batchNumber}`),
   }
   return { database: next, record: updatedPurchase }
 }
@@ -737,7 +932,7 @@ export function updateClaimStatus(database, claimId, status, resolution = '') {
   const suppliers = (status === 'Approved' || status === 'Replacement') && claim.supplierId ? updateBalance(database.suppliers, claim.supplierId, -Number(claim.amount || 0)) : database.suppliers
   let products = database.products
   let stockMovements = database.stockMovements
-  if ((status === 'Approved' || status === 'Replacement') && claim.productId) {
+  if ((status === 'Approved' || status === 'Replacement') && claim.productId && !claim.inventoryManagedBySource) {
     products = products.map((product) => product.id === claim.productId ? {
       ...product,
       defectiveQuantity: Math.max(0, Number(product.defectiveQuantity || 0) - claim.quantity),
@@ -756,7 +951,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'create-sale': {
       if (input.idempotencyKey && database.sales.some((sale) => sale.idempotencyKey === String(input.idempotencyKey).trim())) return createSale(database, input)
       assertSaleDayOpen(database, { date: businessDate, branchId })
-      return createSale(database, { ...input, date: businessDate, branchId })
+      return createSale(database, { ...input, date: businessDate, branchId }, { actor: context.actor })
     }
     case 'receive-purchase': return receivePurchase(database, input)
     case 'update-purchase': return updatePurchase(database, input)
@@ -1266,14 +1461,15 @@ function validateRelationships(database) {
     assertReference('suppliers', purchase.supplierId, 'purchase/supplier relationship')
     for (const item of purchase.items || []) {
       assertReference('products', item.productId, 'purchase item/product relationship')
-      if (purchase.batchNumber && item.batchNumber !== purchase.batchNumber) throw new Error('Receiving items must belong to their bill Batch Number.')
+      if (purchase.batchNumber && !item.batchNumber) throw new Error('Receiving items must retain their assigned Batch Number.')
     }
   }
   for (const product of database.products) {
     if (!product.purchaseId) continue
     assertReference('purchases', product.purchaseId, 'stock/receiving relationship')
     const purchase = database.purchases.find((entry) => entry.id === product.purchaseId)
-    if (purchase.batchNumber && product.batchNumber !== purchase.batchNumber) throw new Error('Received stock must retain its bill Batch Number.')
+    const linkedItemBatch = (purchase.items || []).some((item) => item.productId === product.id && item.batchNumber === product.batchNumber)
+    if (purchase.batchNumber && product.batchNumber !== purchase.batchNumber && !linkedItemBatch) throw new Error('Received stock must retain its bill or item Batch Number.')
   }
   for (const entry of database.returns) {
     assertReference('sales', entry.saleId, 'customer return/sale relationship')
