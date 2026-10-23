@@ -1357,6 +1357,19 @@ export function saveBankBalances(database, input, actor = null) {
   return { database: next, record: records.filter((entry) => entry.date === date && entry.createdAt === createdAt) }
 }
 
+export function financialPeriodDatabase(database, from = '', to = '') {
+  const inRange = (value) => { const date = String(value || '').slice(0, 10); return (!from || date >= from) && (!to || date <= to) }
+  const byId = new Map(database.sales.map(sale => [sale.id, sale]))
+  return { ...database,
+    sales: database.sales.filter(sale => inRange(sale.date)).map(sale => ({ ...sale, total: Number(sale.total ?? sale.totalAmount ?? 0) + Number(sale.returnTotal || 0), returnTotal: 0, items: (sale.items || []).filter(item => !item.isReturn) })),
+    returns: database.returns.filter(entry => inRange(byId.get(entry.saleId)?.date || entry.saleDate || entry.date)).map(entry => {
+      const item = byId.get(entry.saleId)?.items?.find(item => entry.lineId ? item.lineId === entry.lineId : item.productId === entry.productId)
+      return { ...entry, refundType: entry.refundType === 'sale-adjustment' ? 'financial-adjustment' : entry.refundType, unitCostAtSale: entry.unitCostAtSale ?? item?.unitCostAtSale ?? item?.costPrice ?? 0 }
+    }),
+    expenses: database.expenses.filter(entry => inRange(entry.date)),
+  }
+}
+
 export function calculateBusinessTotals(database) {
   const getGrossBilled = (sale) => Number(sale.subtotal ?? (sale.items || []).filter((item) => !item.isReturn).reduce((sum, item) => sum + Number(item.lineTotal ?? Number(item.quantity || 0) * Number(item.unitPrice ?? item.price ?? 0)), 0))
   const getDiscount = (sale) => Number(sale.discount || 0)
@@ -1998,7 +2011,7 @@ export function calculateReports(database, { from, to, period } = {}) {
   const purchases = filterByDateRange(database.purchases, bounds.from, bounds.to)
   const expenses = filterByDateRange(database.expenses, bounds.from, bounds.to)
   const payments = filterByDateRange(database.payments, bounds.from, bounds.to)
-  const subset = { ...database, sales, purchases, expenses, payments, returns: filterByDateRange(database.returns, bounds.from, bounds.to) }
+  const subset = { ...financialPeriodDatabase(database, bounds.from, bounds.to), purchases, expenses, payments }
   return {
     period: period || 'custom',
     from: bounds.from,
