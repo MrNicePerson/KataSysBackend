@@ -704,6 +704,7 @@ test('cleared incoming cheque records payment and reduces customer due', () => {
     partyId: 'customer-1',
     amount: 12,
     number: 'CHQ-1',
+    bank: 'HBL',
     expectedClearanceDate: '2026-10-05',
   })
   const cleared = updateChequeStatus(created.database, created.record.id, 'Cleared')
@@ -841,6 +842,8 @@ test('bounced cheques remain distinct and reverse the balance after prior cleara
     partyType: 'customer',
     partyId: 'customer-1',
     amount: 12,
+    number: 'CHQ-BOUNCE',
+    bank: 'HBL',
   })
   const cleared = updateChequeStatus(created.database, created.record.id, 'Cleared')
   const bounced = updateChequeStatus(cleared.database, created.record.id, 'Bounced')

@@ -1,0 +1,630 @@
+{
+  "date": "2026-10-23",
+  "scope": "100 deterministic domain misuse scenarios; isolated synthetic data; no production writes",
+  "results": [
+    {
+      "id": "001",
+      "area": "Sales",
+      "title": "Empty sale",
+      "status": "PASS"
+    },
+    {
+      "id": "002",
+      "area": "Sales",
+      "title": "Negative sale quantity",
+      "status": "PASS"
+    },
+    {
+      "id": "003",
+      "area": "Sales",
+      "title": "Fractional sale quantity",
+      "status": "PASS"
+    },
+    {
+      "id": "004",
+      "area": "Sales",
+      "title": "Missing stock reference",
+      "status": "PASS"
+    },
+    {
+      "id": "005",
+      "area": "Sales",
+      "title": "Oversell available stock",
+      "status": "PASS"
+    },
+    {
+      "id": "006",
+      "area": "Sales",
+      "title": "Duplicate lines oversell stock",
+      "status": "PASS"
+    },
+    {
+      "id": "007",
+      "area": "Sales",
+      "title": "Negative price",
+      "status": "PASS"
+    },
+    {
+      "id": "008",
+      "area": "Sales",
+      "title": "Discount exceeds bill",
+      "status": "PASS"
+    },
+    {
+      "id": "009",
+      "area": "Sales",
+      "title": "Cash overpayment",
+      "status": "PASS"
+    },
+    {
+      "id": "010",
+      "area": "Sales",
+      "title": "Cash plus cheque overpayment",
+      "status": "PASS"
+    },
+    {
+      "id": "011",
+      "area": "Stock",
+      "title": "Negative initial stock",
+      "status": "PASS"
+    },
+    {
+      "id": "012",
+      "area": "Stock",
+      "title": "Fractional initial stock",
+      "status": "PASS"
+    },
+    {
+      "id": "013",
+      "area": "Stock",
+      "title": "Blank product name",
+      "status": "PASS"
+    },
+    {
+      "id": "014",
+      "area": "Stock",
+      "title": "Duplicate product batch and size",
+      "status": "PASS"
+    },
+    {
+      "id": "015",
+      "area": "Stock",
+      "title": "Negative product cost",
+      "status": "PASS"
+    },
+    {
+      "id": "016",
+      "area": "Stock",
+      "title": "Infinite product price",
+      "status": "PASS"
+    },
+    {
+      "id": "017",
+      "area": "Stock",
+      "title": "Remove more stock than exists",
+      "status": "PASS"
+    },
+    {
+      "id": "018",
+      "area": "Stock",
+      "title": "Invalid stock direction",
+      "status": "PASS"
+    },
+    {
+      "id": "019",
+      "area": "Stock",
+      "title": "Rename product to blank",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "020",
+      "area": "Stock",
+      "title": "Client supplied product ID collision",
+      "status": "FAIL",
+      "error": "Expected \"actual\" to be strictly unequal to: 'p'"
+    },
+    {
+      "id": "021",
+      "area": "Returns",
+      "title": "Return without original sale",
+      "status": "PASS"
+    },
+    {
+      "id": "022",
+      "area": "Returns",
+      "title": "Return wrong invoice line",
+      "status": "PASS"
+    },
+    {
+      "id": "023",
+      "area": "Returns",
+      "title": "Negative return quantity",
+      "status": "PASS"
+    },
+    {
+      "id": "024",
+      "area": "Returns",
+      "title": "Fractional return quantity",
+      "status": "PASS"
+    },
+    {
+      "id": "025",
+      "area": "Returns",
+      "title": "Return exceeds sold quantity",
+      "status": "PASS"
+    },
+    {
+      "id": "026",
+      "area": "Returns",
+      "title": "Unknown refund type",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "027",
+      "area": "Returns",
+      "title": "Unknown return condition",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "028",
+      "area": "Returns",
+      "title": "Repeated return exceeds remaining invoice quantity",
+      "status": "PASS"
+    },
+    {
+      "id": "029",
+      "area": "Returns",
+      "title": "Discounted full return cannot refund more than original invoice",
+      "status": "FAIL",
+      "error": "Expected values to be strictly equal:\n\n20 !== 15\n"
+    },
+    {
+      "id": "030",
+      "area": "Returns",
+      "title": "Rejected return leaves source state untouched",
+      "status": "PASS"
+    },
+    {
+      "id": "031",
+      "area": "Payments",
+      "title": "Zero payment",
+      "status": "PASS"
+    },
+    {
+      "id": "032",
+      "area": "Payments",
+      "title": "Negative payment",
+      "status": "PASS"
+    },
+    {
+      "id": "033",
+      "area": "Payments",
+      "title": "NaN payment",
+      "status": "PASS"
+    },
+    {
+      "id": "034",
+      "area": "Payments",
+      "title": "Missing payment account",
+      "status": "PASS"
+    },
+    {
+      "id": "035",
+      "area": "Payments",
+      "title": "Unsupported payment method",
+      "status": "PASS"
+    },
+    {
+      "id": "036",
+      "area": "Payments",
+      "title": "Unsupported expense method",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "037",
+      "area": "Payments",
+      "title": "Zero expense",
+      "status": "PASS"
+    },
+    {
+      "id": "038",
+      "area": "Payments",
+      "title": "Duplicate bulk recovery customer",
+      "status": "PASS"
+    },
+    {
+      "id": "039",
+      "area": "Payments",
+      "title": "Bulk recovery exceeds debt",
+      "status": "PASS"
+    },
+    {
+      "id": "040",
+      "area": "Payments",
+      "title": "Rename account to blank",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "041",
+      "area": "Cheques",
+      "title": "Zero cheque",
+      "status": "PASS"
+    },
+    {
+      "id": "042",
+      "area": "Cheques",
+      "title": "Negative cheque",
+      "status": "PASS"
+    },
+    {
+      "id": "043",
+      "area": "Cheques",
+      "title": "Missing cheque customer",
+      "status": "PASS"
+    },
+    {
+      "id": "044",
+      "area": "Cheques",
+      "title": "Invalid cheque party type",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "045",
+      "area": "Cheques",
+      "title": "Invalid cheque direction",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "046",
+      "area": "Cheques",
+      "title": "Blank cheque number",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "047",
+      "area": "Cheques",
+      "title": "Blank cheque bank",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "048",
+      "area": "Cheques",
+      "title": "Impossible cheque due date",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "049",
+      "area": "Cheques",
+      "title": "Clearing the same cheque twice only credits once",
+      "status": "PASS"
+    },
+    {
+      "id": "050",
+      "area": "Cheques",
+      "title": "Negative bounce charges rejected",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "051",
+      "area": "Banks",
+      "title": "Blank bank name",
+      "status": "PASS"
+    },
+    {
+      "id": "052",
+      "area": "Banks",
+      "title": "Duplicate bank name",
+      "status": "PASS"
+    },
+    {
+      "id": "053",
+      "area": "Banks",
+      "title": "Negative bank opening amount",
+      "status": "PASS"
+    },
+    {
+      "id": "054",
+      "area": "Banks",
+      "title": "Transfer to same account",
+      "status": "PASS"
+    },
+    {
+      "id": "055",
+      "area": "Banks",
+      "title": "Transfer to missing account",
+      "status": "PASS"
+    },
+    {
+      "id": "056",
+      "area": "Banks",
+      "title": "Negative transfer",
+      "status": "PASS"
+    },
+    {
+      "id": "057",
+      "area": "Banks",
+      "title": "Zero transfer",
+      "status": "PASS"
+    },
+    {
+      "id": "058",
+      "area": "Banks",
+      "title": "Impossible transfer date",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "059",
+      "area": "Banks",
+      "title": "Invalid bank balance",
+      "status": "PASS"
+    },
+    {
+      "id": "060",
+      "area": "Banks",
+      "title": "Inactive transfer source",
+      "status": "PASS"
+    },
+    {
+      "id": "061",
+      "area": "Closing",
+      "title": "Closing without opening",
+      "status": "PASS"
+    },
+    {
+      "id": "062",
+      "area": "Closing",
+      "title": "Closing pending due cheque",
+      "status": "PASS"
+    },
+    {
+      "id": "063",
+      "area": "Closing",
+      "title": "Closing cheque under clearing",
+      "status": "PASS"
+    },
+    {
+      "id": "064",
+      "area": "Closing",
+      "title": "Invalid daily record date",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "065",
+      "area": "Closing",
+      "title": "Impossible daily record date",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "066",
+      "area": "Closing",
+      "title": "Negative opening cash",
+      "status": "PASS"
+    },
+    {
+      "id": "067",
+      "area": "Closing",
+      "title": "Negative counted cash",
+      "status": "PASS"
+    },
+    {
+      "id": "068",
+      "area": "Closing",
+      "title": "Unknown daily record type",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "069",
+      "area": "Closing",
+      "title": "Sale without business-day opening",
+      "status": "PASS"
+    },
+    {
+      "id": "070",
+      "area": "Closing",
+      "title": "Staff overwrites saved daily opening",
+      "status": "PASS"
+    },
+    {
+      "id": "071",
+      "area": "Backup",
+      "title": "Unsupported backup version",
+      "status": "PASS"
+    },
+    {
+      "id": "072",
+      "area": "Backup",
+      "title": "Missing products collection",
+      "status": "PASS"
+    },
+    {
+      "id": "073",
+      "area": "Backup",
+      "title": "Duplicate product IDs",
+      "status": "PASS"
+    },
+    {
+      "id": "074",
+      "area": "Backup",
+      "title": "Null product row",
+      "status": "PASS"
+    },
+    {
+      "id": "075",
+      "area": "Backup",
+      "title": "Product without ID",
+      "status": "PASS"
+    },
+    {
+      "id": "076",
+      "area": "Backup",
+      "title": "Dangling sale customer",
+      "status": "PASS"
+    },
+    {
+      "id": "077",
+      "area": "Backup",
+      "title": "Dangling sale product",
+      "status": "PASS"
+    },
+    {
+      "id": "078",
+      "area": "Backup",
+      "title": "Dangling bank transaction",
+      "status": "PASS"
+    },
+    {
+      "id": "079",
+      "area": "Backup",
+      "title": "Negative stock backup",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "080",
+      "area": "Backup",
+      "title": "Invalid numeric customer balance",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "081",
+      "area": "Held orders",
+      "title": "Empty held order",
+      "status": "PASS"
+    },
+    {
+      "id": "082",
+      "area": "Held orders",
+      "title": "Invalid held order kind",
+      "status": "PASS"
+    },
+    {
+      "id": "083",
+      "area": "Held orders",
+      "title": "Negative held quantity",
+      "status": "PASS"
+    },
+    {
+      "id": "084",
+      "area": "Held orders",
+      "title": "Fractional held quantity",
+      "status": "PASS"
+    },
+    {
+      "id": "085",
+      "area": "Held orders",
+      "title": "Held order oversells stock",
+      "status": "PASS"
+    },
+    {
+      "id": "086",
+      "area": "Held orders",
+      "title": "Missing held stock item",
+      "status": "PASS"
+    },
+    {
+      "id": "087",
+      "area": "Held orders",
+      "title": "Duplicate held lines overreserve stock",
+      "status": "PASS"
+    },
+    {
+      "id": "088",
+      "area": "Held orders",
+      "title": "Release unknown held order",
+      "status": "PASS"
+    },
+    {
+      "id": "089",
+      "area": "Held orders",
+      "title": "Cannot sell reserved stock",
+      "status": "PASS"
+    },
+    {
+      "id": "090",
+      "area": "Held orders",
+      "title": "Releasing reservation restores availability once",
+      "status": "PASS"
+    },
+    {
+      "id": "091",
+      "area": "Installments",
+      "title": "Missing installment customer",
+      "status": "PASS"
+    },
+    {
+      "id": "092",
+      "area": "Installments",
+      "title": "Negative installment total",
+      "status": "PASS"
+    },
+    {
+      "id": "093",
+      "area": "Installments",
+      "title": "Zero installment count",
+      "status": "PASS"
+    },
+    {
+      "id": "094",
+      "area": "Installments",
+      "title": "Fractional installment count",
+      "status": "PASS"
+    },
+    {
+      "id": "095",
+      "area": "Installments",
+      "title": "Zero installment total",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "096",
+      "area": "Installments",
+      "title": "Impossible installment start date",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "097",
+      "area": "Installments",
+      "title": "Installment overpayment",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "098",
+      "area": "Installments",
+      "title": "Cheque installment does not count as paid before clearance",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    },
+    {
+      "id": "099",
+      "area": "Installments",
+      "title": "Schedule amounts sum to total after rounding",
+      "status": "PASS"
+    },
+    {
+      "id": "100",
+      "area": "Installments",
+      "title": "Completed plan cannot accept another payment",
+      "status": "FAIL",
+      "error": "Invalid request was accepted"
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+import { requireDate, returnRefundAmount, validateBackupNumbers } from './inputValidation.js'
 import { nextReceivingBatch, receivingLabel } from './receiving.js'
 
 export const APP_DB_VERSION = 2
@@ -60,7 +61,7 @@ export function assertSaleDayOpen(database, context = {}) {
   if (!status.canCreateSale) throw new Error(status.reason)
   return status
 }
-const dateOf = (value) => value || localDateString()
+const dateOf = (value) => requireDate(value || localDateString())
 const amountOf = (value) => {
   const amount = Number(value)
   if (!Number.isFinite(amount) || amount < 0) throw new Error('Amounts must be zero or greater.')
@@ -78,7 +79,7 @@ const nonnegativeWholeQuantity = (value) => {
   return quantity
 }
 const makeId = (prefix) => `${prefix}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`
-const record = (prefix, values) => ({ id: makeId(prefix), createdAt: now(), ...values })
+const record = (prefix, values) => ({ createdAt: now(), ...values, id: makeId(prefix) })
 export function receivingBatchNumber(database, supplier, date) {
   return nextReceivingBatch(database, supplier, date).batchNumber
 }
@@ -190,12 +191,13 @@ export function createSale(database, input, { actor = null } = {}) {
     const quantity = positiveQuantity(item.returnQuantity ?? item.quantity)
     const alreadyReturned = database.returns.filter((entry) => entry.saleId === originalSale.id && (entry.lineId ? entry.lineId === originalItem.lineId : entry.productId === originalItem.productId)).reduce((sum, entry) => sum + Number(entry.quantity || 0), 0)
     if (alreadyReturned + quantity > originalItem.quantity) throw new Error('Return quantity exceeds the amount sold and not yet returned.')
-    return { originalSale, originalItem, quantity, condition: item.returnCondition || 'sellable', amount: quantity * Number(originalItem.unitPrice ?? originalItem.price ?? 0) }
+    return { originalSale, originalItem, quantity, condition: item.returnCondition || 'sellable', amount: returnRefundAmount(originalSale, originalItem, quantity, alreadyReturned) }
   })
   for (let i = 0; i < returnItems.length; i += 1) {
     const current = returnItems.slice(0, i).filter((entry) => entry.originalItem.lineId === returnItems[i].originalItem.lineId && entry.originalSale.id === returnItems[i].originalSale.id).reduce((sum, entry) => sum + entry.quantity, 0)
     const already = database.returns.filter((entry) => entry.saleId === returnItems[i].originalSale.id && entry.lineId === returnItems[i].originalItem.lineId).reduce((sum, entry) => sum + Number(entry.quantity || 0), 0)
     if (already + current + returnItems[i].quantity > returnItems[i].originalItem.quantity) throw new Error('Combined return quantities exceed the amount sold.')
+    returnItems[i].amount = returnRefundAmount(returnItems[i].originalSale, returnItems[i].originalItem, returnItems[i].quantity, already + current)
   }
   const discount = amountOf(input.discount ?? 0)
   if (discount > subtotal) throw new Error('Discount cannot exceed the subtotal.')
@@ -837,7 +839,8 @@ export function assertDueCustomerChequesUpdated(database, date) {
 
 export function saveDailyRecord(database, input, actor = null) {
   const date = dateOf(input.date)
-  const type = input.type === 'opening' ? 'opening' : 'closing'
+  if (!['opening', 'closing'].includes(input.type)) throw new Error('Daily record type must be opening or closing.')
+  const type = input.type
   if (type === 'closing') assertDueCustomerChequesUpdated(database, date)
   const branchId = normalizeBranchId(input.branchId)
   if (type === 'closing' && !database.dailyClosings.some((entry) => entry.date === date && entry.type === 'opening' && recordMatchesBranch(entry, branchId))) {
@@ -1021,7 +1024,10 @@ export function processCustomerReturn(database, input) {
   const alreadyReturned = database.returns.filter((entry) => entry.saleId === sale.id && (entry.lineId || entry.productId) === returnKey).reduce((sum, entry) => sum + entry.quantity, 0)
   const soldQuantity = originalItem.lineId ? originalItem.quantity : sale.items.filter((item) => item.productId === originalItem.productId).reduce((sum, item) => sum + item.quantity, 0)
   if (alreadyReturned + quantity > soldQuantity) throw new Error('Return quantity exceeds the amount sold and not yet returned.')
-  const amount = quantity * originalItem.unitPrice
+  if (input.refundType && !['cash', 'khata'].includes(input.refundType)) throw new Error('Refund type must be cash or khata.')
+  if (input.condition && !['sellable', 'Sellable stock', 'damaged', 'defective', 'Damaged / Defective'].includes(input.condition)) throw new Error('Choose a valid return condition.')
+  if (originalItem.isReturn) throw new Error('A return line cannot itself be returned.')
+  const amount = returnRefundAmount(sale, originalItem, quantity, alreadyReturned)
   const condition = input.condition || 'sellable'
   const result = record('return', { saleId: sale.id, saleNumber: sale.number, customerId: sale.customerId, productId: originalItem.productId, lineId: originalItem.lineId, code: originalItem.code, itemName: originalItem.name, quantity, unitPrice: originalItem.unitPrice, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), amount, condition, refundType: input.refundType || 'khata', date: dateOf(input.date) })
   let products = database.products
@@ -1083,6 +1089,7 @@ export function recordExpense(database, input) {
   const amount = amountOf(input.amount)
   if (amount <= 0) throw new Error('Expense amount must be greater than zero.')
   const method = input.method || 'cash'
+  if (!['cash', 'bank', 'cheque'].includes(method)) throw new Error('Expense method must be cash, bank, or cheque.')
   const expense = record('expense', { category: input.category || 'Other', amount, date: dateOf(input.date), description: input.description || '', paidTo: input.paidTo || '', method, account: input.account || method })
   const next = { ...database, expenses: [expense, ...database.expenses], auditHistory: addAudit(database, 'expense', expense.id, `${expense.category} expense recorded`) }
   return { database: next, record: expense }
@@ -1093,6 +1100,7 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
   if (!allowedStatuses.includes(status)) throw new Error('Choose a valid cheque transaction status.')
   const cheque = database.cheques.find((entry) => entry.id === chequeId)
   if (!cheque) throw new Error('Cheque could not be found.')
+  if (options.bankCharges != null) amountOf(options.bankCharges)
   if (cheque.status === status) return { database, record: cheque }
   const previousStatus = cheque.status || 'Pending'
   const pendingStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled']
@@ -1118,7 +1126,7 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
     ...(bounced ? {
       bounceDate: options.bounceDate || dateOf(),
       bounceReason: String(options.bounceReason || options.remarks || '').trim(),
-      bankCharges: Number(options.bankCharges || 0),
+      bankCharges: amountOf(options.bankCharges || 0),
     } : {}),
   }
   let next = { ...database, cheques: database.cheques.map((entry) => entry.id === chequeId ? updated : entry) }
@@ -1140,7 +1148,9 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
 export function updateChequeDetails(database, input, actor = null) {
   const cheque = database.cheques.find((entry) => entry.id === input.chequeId)
   if (!cheque) throw new Error('Cheque could not be found.')
-  const dueDate = String(input.expectedClearanceDate ?? cheque.expectedClearanceDate ?? '').slice(0, 10)
+  const dueDate = String(input.expectedClearanceDate ?? cheque.expectedClearanceDate ?? '')
+  if (dueDate) requireDate(dueDate)
+  if (!dueDate && (cheque.expectedClearanceDate || cheque.dueDate)) throw new Error('A cheque due date cannot be removed. Reschedule to a valid date.')
   if (dueDate && Number.isNaN(Date.parse(`${dueDate}T00:00:00Z`))) throw new Error('Enter a valid expected clearance date.')
   const oldDate = cheque.expectedClearanceDate || ''
   const changedDate = dueDate !== oldDate
@@ -1468,6 +1478,7 @@ export function validateBackup(data) {
       database[key] = data[key]
     }
   }
+  validateBackupNumbers(database)
   if (currentFormat) validateRelationships(database)
   return database
 }
@@ -1529,6 +1540,12 @@ function validateRelationships(database) {
 export function createManualCheque(database, input, actor = null) {
   const amount = amountOf(input.amount)
   if (!amount) throw new Error('Cheque amount must be greater than zero.')
+  if (input.direction && !['given', 'received'].includes(input.direction)) throw new Error('Cheque direction must be received or given.')
+  if (input.partyType && !['customer', 'supplier'].includes(input.partyType)) throw new Error('Cheque party must be customer or supplier.')
+  if (!String(input.number || '').trim()) throw new Error('Cheque number is required.')
+  if (!String(input.bank || '').trim()) throw new Error('Cheque bank is required.')
+  if (input.dueDate) requireDate(input.dueDate)
+  if (input.expectedClearanceDate) requireDate(input.expectedClearanceDate)
   const direction = input.direction === 'given' ? 'given' : 'received'
   const partyType = input.partyType || (direction === 'given' ? 'supplier' : 'customer')
   const collection = partyType === 'supplier' ? 'suppliers' : 'customers'
@@ -1692,7 +1709,9 @@ export function createInstallmentPlan(database, input) {
   const customer = database.customers.find((entry) => entry.id === input.customerId)
   if (!customer) throw new Error('The customer account could not be found.')
   const totalAmount = amountOf(input.totalAmount)
+  if (totalAmount <= 0) throw new Error('Installment total must be greater than zero.')
   const installmentCount = positiveQuantity(input.installmentCount)
+  if (installmentCount > 1200) throw new Error('Installment count cannot exceed 1200.')
   const amountEach = Math.round((totalAmount / installmentCount) * 100) / 100
   const startDate = dateOf(input.startDate || input.date)
   const schedule = Array.from({ length: installmentCount }, (_, index) => {
@@ -1718,8 +1737,11 @@ export function createInstallmentPlan(database, input) {
 export function receiveInstallmentPayment(database, input) {
   const plan = (database.installments || []).find((entry) => entry.id === input.installmentId)
   if (!plan) throw new Error('Installment plan could not be found.')
+  if (plan.status === 'completed') throw new Error('This installment plan is already completed.')
+  if (input.method && !['cash', 'bank'].includes(input.method)) throw new Error('Installments require a settled cash or bank payment.')
   const amount = amountOf(input.amount)
   if (!amount) throw new Error('Installment amount must be greater than zero.')
+  if (amount > Number(plan.totalAmount) - Number(plan.paidAmount || 0) + 0.005) throw new Error('Installment payment exceeds the remaining balance.')
   let remaining = amount
   const schedule = plan.schedule.map((row) => {
     if (!remaining || row.status === 'paid') return row
@@ -1747,6 +1769,7 @@ export function receiveInstallmentPayment(database, input) {
 export function updateProductDetails(database, input) {
   const product = database.products.find((entry) => entry.id === input.productId)
   if (!product) throw new Error('Product could not be found.')
+  if (input.name != null && !String(input.name).trim()) throw new Error('Product name is required.')
   const updated = {
     ...product,
     name: input.name == null ? product.name : String(input.name).trim(),
@@ -1770,6 +1793,7 @@ export function updateAccountDetails(database, input) {
   if (!account) throw new Error(`The ${input.accountType || 'customer'} account could not be found.`)
   const supplierCode = input.accountType === 'supplier' && input.supplierCode != null ? String(input.supplierCode).trim().toUpperCase() : account.supplierCode
   if (input.accountType === 'supplier' && supplierCode && database.suppliers.some((entry) => entry.id !== account.id && String(entry.supplierCode || '').trim().toUpperCase() === supplierCode)) throw new Error('A supplier with this code already exists.')
+  if (input.name != null && !String(input.name).trim()) throw new Error('Account name is required.')
   const updated = {
     ...account,
     name: input.name == null ? account.name : String(input.name).trim(),

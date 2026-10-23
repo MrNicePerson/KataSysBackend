@@ -108,7 +108,7 @@ test('legacy references and mixed historical item batches remain readable withou
 test('missing supplier codes and invalid dates cannot generate manual or malformed batches', () => {
   const db = fixture()
   for (const arrivalDate of ['', '2026-02-30', 'invalid']) {
-    if (arrivalDate) assert.throws(() => receivePurchase(db, input({ arrivalDate })), /date is invalid/)
+    if (arrivalDate) assert.throws(() => receivePurchase(db, input({ arrivalDate })), /valid calendar date|date is invalid/)
   }
   db.suppliers[0].supplierCode = ''
   assert.throws(() => receivePurchase(db, input()), /Supplier Code/)
