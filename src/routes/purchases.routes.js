@@ -32,6 +32,7 @@ purchasesRouter.get('/:id', (req, res) => {
 })
 
 purchasesRouter.post('/', mutate('receive-purchase'))
+purchasesRouter.post('/tan-types', mutate('create-tan-type'))
 purchasesRouter.patch('/:id', mutate('update-purchase', {
   status: 200,
   input: (req) => ({ ...req.body, purchaseId: req.params.id }),

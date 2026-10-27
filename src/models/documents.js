@@ -21,6 +21,7 @@ function modelFor(name) {
 
 export const ARRAY_COLLECTIONS = [
   'products',
+  'tanTypes',
   'categories',
   'customers',
   'suppliers',

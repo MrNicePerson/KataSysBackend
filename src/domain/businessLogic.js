@@ -7,6 +7,7 @@ export function createEmptyDatabase() {
   return {
     version: APP_DB_VERSION,
     products: [],
+    tanTypes: [],
     categories: [],
     customers: [],
     suppliers: [],
@@ -174,7 +175,10 @@ export function createSale(database, input, { actor = null } = {}) {
     const unitPrice = amountOf(item.price ?? item.unitPrice ?? product.salePrice)
     const reserved = Number(product.reservedQuantity || 0)
     if (Number(product.stockQuantity || 0) - reserved < quantity) throw new Error(`Not enough available stock for ${product.name}.`)
-    return { lineId: makeId('line'), productId: product.id, code: product.code ?? '', name: product.name, quantity, price: unitPrice, unitPrice, unitCostAtSale: Number(product.averageCost || 0), lineTotal: quantity * unitPrice }
+    if (product.productType === 'tan' && (!(Number(product.metersPerTan) > 0) || !(Number(product.salePricePerMeter) >= 0))) throw new Error('Tan stock is missing valid length or price details.')
+    const tan = product.productType === 'tan'
+    const lineTotal = tan ? quantity * Number(product.metersPerTan) * unitPrice : quantity * unitPrice
+    return { lineId: makeId('line'), productId: product.id, code: product.code ?? '', name: product.name, productType: tan ? 'tan' : 'suit', tanType: product.tanType || '', batchNumber: product.batchNumber || '', metersPerTan: tan ? Number(product.metersPerTan) : undefined, quantity, price: unitPrice, unitPrice, unitCostAtSale: Number(product.averageCost || 0), lineTotal }
   })
   const subtotal = saleItems.reduce((sum, item) => sum + item.lineTotal, 0)
   for (const product of database.products) {
@@ -225,7 +229,7 @@ export function createSale(database, input, { actor = null } = {}) {
     customerPhone: input.customerPhone || '',
     customerAddress: input.customerAddress || '',
     padInvoiceNumber: input.padInvoiceNumber || input.paidInvoiceNumber || '',
-    items: [...saleItems, ...returnItems.map(({ originalSale, originalItem, quantity, condition, amount }) => ({ lineId: makeId('line'), productId: originalItem.productId, code: originalItem.code, name: `Return · ${originalItem.name}`, quantity, price: -amount / quantity, unitPrice: -amount / quantity, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), lineTotal: -amount, isReturn: true, returnCondition: condition, originalSaleId: originalSale.id, originalSaleLineId: originalItem.lineId }))],
+    items: [...saleItems, ...returnItems.map(({ originalSale, originalItem, quantity, condition, amount }) => ({ lineId: makeId('line'), productId: originalItem.productId, code: originalItem.code, name: `Return · ${originalItem.name}`, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || '', metersPerTan: originalItem.metersPerTan, quantity, price: originalItem.productType === 'tan' ? -Number(originalItem.price ?? originalItem.unitPrice ?? 0) : -amount / quantity, unitPrice: originalItem.productType === 'tan' ? -Number(originalItem.unitPrice ?? originalItem.price ?? 0) : -amount / quantity, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), lineTotal: -amount, isReturn: true, returnCondition: condition, originalSaleId: originalSale.id, originalSaleLineId: originalItem.lineId }))],
     subtotal,
     discount,
     returnTotal,
@@ -252,7 +256,7 @@ export function createSale(database, input, { actor = null } = {}) {
   let returnRecords = []
   let claims = database.claims
   for (const item of returnItems) {
-    const returnRecord = record('return', { saleId: item.originalSale.id, saleNumber: item.originalSale.number, adjustmentSaleId: sale.id, customerId: item.originalSale.customerId, productId: item.originalItem.productId, lineId: item.originalItem.lineId, code: item.originalItem.code, itemName: item.originalItem.name, quantity: item.quantity, unitPrice: item.amount / item.quantity, amount: item.amount, condition: item.condition, refundType: refundDue > 0 ? refundType : 'sale-adjustment', date: sale.date })
+    const returnRecord = record('return', { saleId: item.originalSale.id, saleNumber: item.originalSale.number, adjustmentSaleId: sale.id, customerId: item.originalSale.customerId, productId: item.originalItem.productId, lineId: item.originalItem.lineId, code: item.originalItem.code, itemName: item.originalItem.name, productType: item.originalItem.productType || 'suit', tanType: item.originalItem.tanType || '', batchNumber: item.originalItem.batchNumber || '', metersPerTan: item.originalItem.metersPerTan, quantity: item.quantity, unitPrice: item.amount / item.quantity, amount: item.amount, condition: item.condition, refundType: refundDue > 0 ? refundType : 'sale-adjustment', date: sale.date })
     returnRecords.push(returnRecord)
     stockMovements = addMovement({ ...database, stockMovements }, { productId: item.originalItem.productId, type: item.condition === 'sellable' ? 'customer-return' : 'customer-return-defective', quantity: item.quantity, referenceId: returnRecord.id, date: sale.date, note: item.originalSale.number })
     if (item.condition === 'damaged') {
@@ -345,7 +349,21 @@ export function receivePurchase(database, input) {
     quantity: positiveQuantity(item.quantity),
     unitCost: amountOf(item.unitCost ?? item.cost ?? 0),
     salePrice: amountOf(item.salePrice ?? 0),
+    productType: item.productType === 'tan' ? 'tan' : 'suit',
+    tanType: String(item.tanType || '').trim(),
+    tanName: String(item.tanName || '').trim(),
+    metersPerTan: item.productType === 'tan' ? Number(item.metersPerTan ?? item.totalMeters) : undefined,
+    buyPricePerMeter: item.productType === 'tan' ? Number(item.buyPricePerMeter) : undefined,
+    salePricePerMeter: item.productType === 'tan' ? Number(item.salePricePerMeter) : undefined,
   }))
+  for (const item of purchaseItems) if (item.productType === 'tan') {
+    if (!item.tanType || !item.tanName) throw new Error('Tan type and name are required.')
+    if (!Number.isFinite(item.metersPerTan) || item.metersPerTan <= 0) throw new Error('Tan length must be greater than zero meters per Tan.')
+    if (!Number.isFinite(item.unitCost) || item.unitCost < 0 || !Number.isFinite(item.salePrice) || item.salePrice < 0) throw new Error('Tan prices must be valid and non-negative.')
+    item.productName = item.tanName
+    item.buyPricePerMeter = item.unitCost / item.metersPerTan
+    item.salePricePerMeter = item.salePrice / item.metersPerTan
+  }
   if (purchaseItems.some((item) => item.productId && !database.products.some((product) => product.id === item.productId))) throw new Error('A delivery item points to a stock product that no longer exists.')
   if (purchaseItems.some((item) => !item.productName && (!item.productId || !database.products.some((product) => product.id === item.productId)))) throw new Error('Each delivery item needs an existing product or a product name/article number.')
   const total = purchaseItems.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
@@ -391,7 +409,7 @@ export function receivePurchase(database, input) {
   let products = [...database.products]
   let stockMovements = database.stockMovements
   for (const item of purchaseItems) {
-    const sameBatch = (entry) =>
+    const sameBatch = (entry) => item.productType !== 'tan' && entry.productType !== 'tan' &&
       entry.supplierId === supplier.id &&
       String(entry.batchNumber || '').trim().toLowerCase() === item.batchNumber.toLowerCase()
     const reusesExistingProduct = Boolean(item.existingProductId)
@@ -407,7 +425,7 @@ export function receivePurchase(database, input) {
       item.size ||= sourceProduct.size || ''
       item.rackLocation ||= sourceProduct.rackLocation || ''
     }
-    let product = reusesExistingProduct
+    let product = item.productType === 'tan' ? null : reusesExistingProduct
       ? selectedExistingProduct
       : item.productId
         ? products.find((entry) => entry.id === item.productId && sameBatch(entry))
@@ -428,7 +446,7 @@ export function receivePurchase(database, input) {
       } : entry)
       stockMovements = addMovement({ ...database, stockMovements }, { productId: product.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: item.batchNumber })
     } else {
-      const newProduct = record('product', { name: item.productName, code: item.code || makeId('sku'), categoryId: null, size: item.size, season: item.season, stockQuantity: item.quantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: item.unitCost, salePrice: item.salePrice, supplierId: supplier.id, batchNumber: item.batchNumber, rackLocation: item.rackLocation, active: true })
+      const newProduct = record('product', { name: item.productName, code: item.code || makeId('sku'), categoryId: null, size: item.size, season: item.season, stockQuantity: item.quantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: item.unitCost, salePrice: item.salePrice, supplierId: supplier.id, batchNumber: item.batchNumber, rackLocation: item.rackLocation, active: true, ...(item.productType === 'tan' ? { productType: 'tan', tanType: item.tanType, metersPerTan: item.metersPerTan, buyPricePerMeter: item.buyPricePerMeter, salePricePerMeter: item.salePricePerMeter } : {}) })
       newProduct.purchaseId = purchase.id
       newProduct.arrivalDate = purchase.date
       products.push(newProduct)
@@ -480,9 +498,21 @@ export function updatePurchase(database, input) {
       quantity: positiveQuantity(submitted.quantity),
       unitCost: amountOf(submitted.unitCost ?? submitted.cost ?? original.unitCost),
       salePrice: amountOf(submitted.salePrice ?? original.salePrice),
+      ...(original.productType === 'tan' ? {
+        productType: 'tan',
+        tanType: String(submitted.tanType ?? original.tanType ?? '').trim(),
+        tanName: String(submitted.tanName ?? submitted.productName ?? original.tanName ?? '').trim(),
+        metersPerTan: Number(submitted.metersPerTan ?? original.metersPerTan),
+        buyPricePerMeter: Number(submitted.unitCost ?? submitted.cost ?? original.unitCost) / Number(submitted.metersPerTan ?? original.metersPerTan),
+        salePricePerMeter: Number(submitted.salePrice ?? original.salePrice) / Number(submitted.metersPerTan ?? original.metersPerTan),
+      } : {}),
       batchNumber: original.batchNumber || purchase.batchNumber,
     }
   })
+  for (const item of items) if (item.productType === 'tan') {
+    if (!item.tanType || !(item.metersPerTan > 0)) throw new Error('Tan type and a positive length are required.')
+    item.productName = item.tanName
+  }
   const date = dateOf(input.date ?? input.arrivalDate ?? purchase.date)
   const total = items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
   const cash = amountOf(input.payments?.cash ?? purchase.payments?.cash ?? 0)
@@ -545,6 +575,7 @@ export function updatePurchase(database, input) {
       season: item.season || '',
       rackLocation: item.rackLocation || '',
       salePrice: item.salePrice,
+      ...(item.productType === 'tan' ? { productType: 'tan', tanType: item.tanType, metersPerTan: item.metersPerTan, buyPricePerMeter: item.buyPricePerMeter, salePricePerMeter: item.salePricePerMeter } : {}),
       stockQuantity,
       averageCost,
       arrivalDate: date,
@@ -765,6 +796,15 @@ export function createProduct(database, input) {
   return { database: next, record: product }
 }
 
+export function createTanType(database, input) {
+  const name = String(input.name || '').trim()
+  if (!name) throw new Error('Tan type is required.')
+  const existing = database.tanTypes || []
+  if (existing.some((entry) => entry.name.toLowerCase() === name.toLowerCase())) throw new Error('This Tan type already exists.')
+  const tanType = record('tan-type', { name, active: true })
+  return { database: { ...database, tanTypes: [tanType, ...existing] }, record: tanType }
+}
+
 export function adjustStock(database, input) {
   const product = database.products.find((entry) => entry.id === input.productId)
   if (!product) throw new Error('Product could not be found.')
@@ -967,6 +1007,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
       return createSale(database, { ...input, date: businessDate, branchId }, { actor: context.actor })
     }
     case 'receive-purchase': return receivePurchase(database, input)
+    case 'create-tan-type': return createTanType(database, input)
     case 'update-purchase': return updatePurchase(database, input)
     case 'customer-return': return processCustomerReturn(database, input)
     case 'supplier-return': return processSupplierReturn(database, input)
@@ -1029,7 +1070,7 @@ export function processCustomerReturn(database, input) {
   if (originalItem.isReturn) throw new Error('A return line cannot itself be returned.')
   const amount = returnRefundAmount(sale, originalItem, quantity, alreadyReturned)
   const condition = input.condition || 'sellable'
-  const result = record('return', { saleId: sale.id, saleNumber: sale.number, customerId: sale.customerId, productId: originalItem.productId, lineId: originalItem.lineId, code: originalItem.code, itemName: originalItem.name, quantity, unitPrice: originalItem.unitPrice, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), amount, condition, refundType: input.refundType || 'khata', date: dateOf(input.date) })
+  const result = record('return', { saleId: sale.id, saleNumber: sale.number, customerId: sale.customerId, productId: originalItem.productId, lineId: originalItem.lineId, code: originalItem.code, itemName: originalItem.name, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || '', metersPerTan: originalItem.metersPerTan, quantity, unitPrice: originalItem.unitPrice, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), amount, condition, refundType: input.refundType || 'khata', date: dateOf(input.date) })
   let products = database.products
   let stockMovements = database.stockMovements
   if (condition === 'sellable' || condition === 'Sellable stock') {
@@ -1058,7 +1099,7 @@ export function processSupplierReturn(database, input) {
   if (alreadyReturned + quantity > receivedQuantity) throw new Error('Return quantity exceeds the amount received and not yet returned.')
   const product = database.products.find((entry) => entry.id === originalItem.productId)
   if (!product || Number(product.stockQuantity || 0) - Number(product.reservedQuantity || 0) < quantity) throw new Error('There is not enough unreserved stock to return this item.')
-  const result = record('supplier-return', { purchaseId: purchase.id, purchaseItemId: originalItem.lineId, supplierId: purchase.supplierId, productId: product.id, code: originalItem.code, itemName: originalItem.productName, quantity, amount: quantity * originalItem.unitCost, date: dateOf(input.date), reason: input.reason || '' })
+  const result = record('supplier-return', { purchaseId: purchase.id, purchaseItemId: originalItem.lineId, supplierId: purchase.supplierId, productId: product.id, code: originalItem.code, itemName: originalItem.productName, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || purchase.batchNumber || '', metersPerTan: originalItem.metersPerTan, buyPricePerMeter: originalItem.buyPricePerMeter, salePricePerMeter: originalItem.salePricePerMeter, quantity, amount: quantity * originalItem.unitCost, date: dateOf(input.date), reason: input.reason || '' })
   const products = database.products.map((entry) => entry.id === product.id ? { ...entry, stockQuantity: Number(entry.stockQuantity) - quantity } : entry)
   const suppliers = updateBalance(database.suppliers, purchase.supplierId, -result.amount)
   result.batchNumber = receivingLabel(purchase)
@@ -1847,7 +1888,8 @@ export function updateSaleBill(database, input) {
       const original = itemByLine.get(lineId)
       if (!original || retainedLineIds.has(lineId)) throw new Error('Bill items must use unique saved item lines.')
       retainedLineIds.add(lineId)
-      return { ...original, quantity, price, unitPrice: price, lineTotal: quantity * price }
+      const tan = original.productType === 'tan'
+      return { ...original, quantity, price, unitPrice: price, lineTotal: quantity * (tan ? Number(original.metersPerTan) : 1) * price }
     }
     const product = getProduct(database.products, { productId: submitted.productId })
     return {
@@ -1855,11 +1897,15 @@ export function updateSaleBill(database, input) {
       productId: product.id,
       code: product.code ?? '',
       name: product.name,
+      productType: product.productType === 'tan' ? 'tan' : 'suit',
+      tanType: product.tanType || '',
+      batchNumber: product.batchNumber || '',
+      metersPerTan: product.productType === 'tan' ? Number(product.metersPerTan) : undefined,
       quantity,
       price,
       unitPrice: price,
       unitCostAtSale: Number(product.averageCost || 0),
-      lineTotal: quantity * price,
+      lineTotal: quantity * (product.productType === 'tan' ? Number(product.metersPerTan) : 1) * price,
     }
   })
   const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0)

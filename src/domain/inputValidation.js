@@ -8,8 +8,8 @@ export function requireDate(value) {
   return value
 }
 export function returnRefundAmount(sale, item, quantity, alreadyReturned = 0) {
-  const price = Number(item.unitPrice ?? item.price ?? 0)
-  const subtotal = Number(sale.subtotal ?? (sale.items || []).filter(line => !line.isReturn).reduce((sum, line) => sum + Number(line.quantity || 0) * Number(line.unitPrice ?? line.price ?? 0), 0))
+  const price = Number(item.unitPrice ?? item.price ?? 0) * (item.productType === 'tan' ? Number(item.metersPerTan || 0) : 1)
+  const subtotal = Number(sale.subtotal ?? (sale.items || []).filter(line => !line.isReturn).reduce((sum, line) => sum + Number(line.lineTotal ?? Number(line.quantity || 0) * Number(line.unitPrice ?? line.price ?? 0)), 0))
   const discount = Number(sale.discount || 0)
   const unitNet = price * (subtotal > 0 ? Math.max(0, 1 - discount / subtotal) : 1)
   const cents = value => Math.round((value + Number.EPSILON) * 100)
