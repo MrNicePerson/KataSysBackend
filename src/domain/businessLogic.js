@@ -559,15 +559,26 @@ export function updatePurchase(database, input) {
   let products = [...database.products]
   const removedItems = purchase.items.filter((item, index) => !seenLineIds.has(item.lineId || `legacy-line-${index}`))
   for (const original of removedItems) {
-    const product = products.find((entry) => entry.id === original.productId)
+    const product = products.find((entry) => entry.id === original.productId) || products.find((entry) =>
+      entry.supplierId === purchase.supplierId
+      && String(entry.batchNumber || '').toLowerCase() === String(original.batchNumber || purchase.batchNumber || '').toLowerCase()
+      && (original.code && entry.code === original.code || original.productName && entry.name === original.productName))
     if (!product) throw new Error('A removed stock product could not be found.')
     const otherPurchase = database.purchases.some((entry) => entry.id !== purchase.id && (entry.items || []).some((item) => item.productId === product.id)) || items.some((item) => item.productId === product.id)
     const otherActivity = (database.stockMovements || []).some((entry) => entry.productId === product.id && !(entry.type === 'purchase' && entry.referenceId === purchase.id))
       || (database.sales || []).some((entry) => (entry.items || []).some((item) => item.productId === product.id))
       || (database.claims || []).some((entry) => entry.productId === product.id)
       || (database.stockAudits || []).some((entry) => (entry.items || []).some((item) => item.productId === product.id))
-    if (otherPurchase || otherActivity || Number(product.reservedQuantity || 0) || Number(product.defectiveQuantity || 0) || Number(product.stockQuantity || 0) !== Number(original.quantity || 0)) throw new Error(`Cannot remove ${product.name}: its stock is used by other records or has changed.`)
-    products = products.filter((entry) => entry.id !== product.id)
+    const quantity = Number(original.quantity || 0)
+    const remaining = Number(product.stockQuantity || 0) - quantity
+    if (remaining < Number(product.reservedQuantity || 0)) throw new Error(`Cannot remove ${product.name}: some of this stock has been sold, used or reserved.`)
+    const hasOtherStock = remaining > 0 || Number(product.defectiveQuantity || 0) > 0
+    if (!otherPurchase && !otherActivity && !hasOtherStock) {
+      products = products.filter((entry) => entry.id !== product.id)
+    } else {
+      const remainingValue = Number(product.stockQuantity || 0) * Number(product.averageCost || 0) - quantity * Number(original.unitCost || 0)
+      products = products.map((entry) => entry.id === product.id ? { ...entry, stockQuantity: remaining, averageCost: remaining > 0 ? Math.max(0, remainingValue / remaining) : Number(entry.averageCost || 0) } : entry)
+    }
   }
   for (const item of items) {
     const original = originalByLine.get(item.lineId)

@@ -362,7 +362,10 @@ test('removing an unused delivery line reconciles stock and supplier balance', (
   assert.equal(changed.database.products.some((product) => product.id === productId), false)
   assert.equal(changed.database.stockMovements.some((entry) => entry.productId === productId), false)
   const used = { ...received.database, products: received.database.products.map((product) => product.id === productId ? { ...product, stockQuantity: 2 } : product) }
-  assert.throws(() => runDatabaseCommand(used, 'update-purchase', { purchaseId: received.record.id, items: [], payments: { cash: 0, bank: 0, cheque: 0 } }), /used by other records or has changed/)
+  assert.throws(() => runDatabaseCommand(used, 'update-purchase', { purchaseId: received.record.id, items: [], payments: { cash: 0, bank: 0, cheque: 0 } }), /sold, used or reserved/)
+  const shared = { ...received.database, products: received.database.products.map((product) => product.id === productId ? { ...product, stockQuantity: 8 } : product), stockMovements: [...received.database.stockMovements, { id: 'other-movement', productId, type: 'adjustment', quantity: 5 }] }
+  const reduced = runDatabaseCommand(shared, 'update-purchase', { purchaseId: received.record.id, items: [], payments: { cash: 0, bank: 0, cheque: 0 } })
+  assert.equal(reduced.database.products.find((product) => product.id === productId).stockQuantity, 5)
 })
 
 test('adding stock to an existing delivery preserves its ID and original items and retries once', () => {
