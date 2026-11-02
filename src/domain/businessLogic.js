@@ -472,7 +472,7 @@ export function updatePurchase(database, input) {
   if (input.appendStock === true) return appendPurchaseItems(database, purchase, input)
   if (input.supplierId && input.supplierId !== purchase.supplierId) throw new Error('A received purchase cannot be moved to another supplier.')
   if (database.supplierReturns.some((entry) => entry.purchaseId === purchase.id)) throw new Error('This delivery has supplier returns and cannot be edited safely.')
-  if (!Array.isArray(input.items) || input.items.length !== purchase.items.length) throw new Error('Keep the delivery item lines unchanged while editing this bill.')
+  if (!Array.isArray(input.items) || input.items.length > purchase.items.length) throw new Error('Delivery item lines must match the saved bill.')
   const originalByLine = new Map(purchase.items.map((item, index) => [item.lineId || `legacy-line-${index}`, item]))
   const seenLineIds = new Set()
   const items = input.items.map((submitted) => {
@@ -557,6 +557,18 @@ export function updatePurchase(database, input) {
     due,
   }
   let products = [...database.products]
+  const removedItems = purchase.items.filter((item, index) => !seenLineIds.has(item.lineId || `legacy-line-${index}`))
+  for (const original of removedItems) {
+    const product = products.find((entry) => entry.id === original.productId)
+    if (!product) throw new Error('A removed stock product could not be found.')
+    const otherPurchase = database.purchases.some((entry) => entry.id !== purchase.id && (entry.items || []).some((item) => item.productId === product.id)) || items.some((item) => item.productId === product.id)
+    const otherActivity = (database.stockMovements || []).some((entry) => entry.productId === product.id && !(entry.type === 'purchase' && entry.referenceId === purchase.id))
+      || (database.sales || []).some((entry) => (entry.items || []).some((item) => item.productId === product.id))
+      || (database.claims || []).some((entry) => entry.productId === product.id)
+      || (database.stockAudits || []).some((entry) => (entry.items || []).some((item) => item.productId === product.id))
+    if (otherPurchase || otherActivity || Number(product.reservedQuantity || 0) || Number(product.defectiveQuantity || 0) || Number(product.stockQuantity || 0) !== Number(original.quantity || 0)) throw new Error(`Cannot remove ${product.name}: its stock is used by other records or has changed.`)
+    products = products.filter((entry) => entry.id !== product.id)
+  }
   for (const item of items) {
     const original = originalByLine.get(item.lineId)
     const deltaQuantity = item.quantity - Number(original.quantity || 0)
