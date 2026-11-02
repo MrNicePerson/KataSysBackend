@@ -1020,6 +1020,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'discard-held-order': return releaseHeldOrder(database, input.heldId, 'discarded')
     case 'create-customer': return createAccount(database, 'customer', input)
     case 'create-supplier': return createAccount(database, 'supplier', input)
+    case 'delete-supplier': return deleteSupplier(database, input.supplierId)
     case 'create-product': return createProduct(database, input)
     case 'adjust-stock': return adjustStock(database, input)
     case 'stock-audit': return recordStockCountAudit(database, input)
@@ -1835,8 +1836,12 @@ export function updateAccountDetails(database, input) {
   const supplierCode = input.accountType === 'supplier' && input.supplierCode != null ? String(input.supplierCode).trim().toUpperCase() : account.supplierCode
   if (input.accountType === 'supplier' && supplierCode && database.suppliers.some((entry) => entry.id !== account.id && String(entry.supplierCode || '').trim().toUpperCase() === supplierCode)) throw new Error('A supplier with this code already exists.')
   if (input.name != null && !String(input.name).trim()) throw new Error('Account name is required.')
+  const balance = input.accountType === 'supplier' && input.balance != null ? Number(input.balance) : Number(account.balance ?? account.openingBalance ?? 0)
+  if (!Number.isFinite(balance)) throw new Error('Balance must be a valid amount.')
+  const previousBalance = Number(account.balance ?? account.openingBalance ?? 0)
   const updated = {
     ...account,
+    ...(input.accountType === 'supplier' && input.balance != null ? { balance, openingBalance: Number(account.openingBalance || 0) + balance - previousBalance } : {}),
     name: input.name == null ? account.name : String(input.name).trim(),
     ...(input.accountType === 'supplier' ? { supplierCode } : {}),
     phone: input.phone == null ? account.phone : String(input.phone).trim(),
@@ -1847,6 +1852,20 @@ export function updateAccountDetails(database, input) {
   }
   const next = { ...database, [key]: database[key].map((entry) => entry.id === account.id ? updated : entry), auditHistory: addAudit(database, `${input.accountType || 'customer'}-update`, account.id, `${updated.name} details updated`) }
   return { database: next, record: updated }
+}
+
+export function deleteSupplier(database, supplierId) {
+  const supplier = database.suppliers.find((entry) => entry.id === supplierId)
+  if (!supplier) throw new Error('Supplier could not be found.')
+  if (Number(supplier.balance || 0) !== 0) throw new Error('Settle the supplier balance before deleting this supplier.')
+  const linked = (database.purchases || []).some((entry) => entry.supplierId === supplierId)
+    || (database.products || []).some((entry) => entry.supplierId === supplierId)
+    || (database.payments || []).some((entry) => entry.supplierId === supplierId)
+    || (database.supplierReturns || []).some((entry) => entry.supplierId === supplierId)
+    || (database.claims || []).some((entry) => entry.supplierId === supplierId)
+    || (database.cheques || []).some((entry) => entry.supplierId === supplierId || (entry.partyType === 'supplier' && entry.partyId === supplierId))
+  if (linked) throw new Error('This supplier has linked transactions or stock and cannot be deleted.')
+  return { database: { ...database, suppliers: database.suppliers.filter((entry) => entry.id !== supplierId), auditHistory: addAudit(database, 'supplier-delete', supplierId, `Supplier ${supplier.name} deleted`) }, record: { id: supplierId, deleted: true } }
 }
 
 export function updateSaleReceiptDetails(database, input) {

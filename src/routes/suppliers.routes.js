@@ -32,4 +32,5 @@ suppliersRouter.get('/:id/statement', (req, res) => {
 
 suppliersRouter.post('/', mutate('create-supplier'))
 suppliersRouter.patch('/:id', mutate('update-account', { status: 200, input: (req) => ({ ...req.body, accountType: 'supplier', accountId: req.params.id }) }))
+suppliersRouter.delete('/:id', mutate('delete-supplier', { status: 200, input: (req) => ({ supplierId: req.params.id }) }))
 suppliersRouter.post('/:id/payments', mutate('account-payment', { input: (req) => ({ ...req.body, accountType: 'supplier', accountId: req.params.id }) }))
