@@ -1312,7 +1312,7 @@ export function calculateDailyClosing(database, date) {
   const bankTransactions = (database.bankTransactions || []).filter((entry) => sameDate(entry))
   const cashWithdrawals = bankTransactions.filter((entry) => entry.type === 'withdrawal' && entry.destination === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const cashDeposits = bankTransactions.filter((entry) => entry.type === 'deposit' && entry.source === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
-  const expectedCash = money(opening + cashSales + customerPayments + cashOtherReceipts + cashWithdrawals - cashExpenses - cashRefunds - cashDeposits)
+  const expectedCash = money(opening + cashSales + customerPayments + cashOtherReceipts + cashWithdrawals - supplierPayments - cashExpenses - cashRefunds - cashDeposits)
   return { date, opening, cashSales, bankSales, chequeSales, creditSales, customerPayments, cashOtherReceipts, supplierPayments, expenseTotal, cashExpenses, bankExpenses, chequeExpenses, cashRefunds, cashWithdrawals, cashDeposits, expectedCash }
 }
 

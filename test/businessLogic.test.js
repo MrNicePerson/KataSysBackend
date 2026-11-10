@@ -349,6 +349,25 @@ test('editing a received purchase reconciles its original stock, supplier due an
   assert.equal(repeated.database.payments.filter((entry) => entry.referenceId === received.record.id).length, 1)
 })
 
+test('removing an unused delivery line reconciles stock and supplier balance', () => {
+  const received = receivePurchase(databaseFixture(), {
+    supplierId: 'supplier-1', arrivalDate: '2026-10-03',
+    items: [{ productName: 'Delete Item', code: 'DEL-1', quantity: 3, unitCost: 7, salePrice: 12 }],
+    payments: { cash: 0 },
+  })
+  const productId = received.record.items[0].productId
+  const changed = runDatabaseCommand(received.database, 'update-purchase', { purchaseId: received.record.id, items: [], payments: { cash: 0, bank: 0, cheque: 0 } })
+  assert.equal(changed.record.total, 0)
+  assert.equal(changed.database.suppliers[0].balance, 0)
+  assert.equal(changed.database.products.some((product) => product.id === productId), false)
+  assert.equal(changed.database.stockMovements.some((entry) => entry.productId === productId), false)
+  const used = { ...received.database, products: received.database.products.map((product) => product.id === productId ? { ...product, stockQuantity: 2 } : product) }
+  assert.throws(() => runDatabaseCommand(used, 'update-purchase', { purchaseId: received.record.id, items: [], payments: { cash: 0, bank: 0, cheque: 0 } }), /sold, used or reserved/)
+  const shared = { ...received.database, products: received.database.products.map((product) => product.id === productId ? { ...product, stockQuantity: 8 } : product), stockMovements: [...received.database.stockMovements, { id: 'other-movement', productId, type: 'adjustment', quantity: 5 }] }
+  const reduced = runDatabaseCommand(shared, 'update-purchase', { purchaseId: received.record.id, items: [], payments: { cash: 0, bank: 0, cheque: 0 } })
+  assert.equal(reduced.database.products.find((product) => product.id === productId).stockQuantity, 5)
+})
+
 test('adding stock to an existing delivery preserves its ID and original items and retries once', () => {
   const received = receivePurchase(databaseFixture(), {
     supplierId: 'supplier-1',
