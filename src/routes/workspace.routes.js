@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { asyncHandler } from '../middleware/errorHandler.js'
-import { getSnapshot } from '../store/snapshotStore.js'
+import { loadSnapshot, withLock } from '../store/snapshotStore.js'
 import { hasPermission, publicUser } from '../models/User.js'
 import { send } from './helpers.js'
 
@@ -31,7 +31,8 @@ const collectionPermissions = {
 export const workspaceRouter = Router()
 
 workspaceRouter.get('/', asyncHandler(async (req, res) => {
-  const snapshot = await getSnapshot()
+  res.set('Cache-Control', 'no-store')
+  const snapshot = await withLock(loadSnapshot)
   const canCashManagement = hasPermission(req.user, 'dailyClosing', 'cashManagement')
     || hasPermission(req.user, 'dailyClosing', 'dailyOpeningCreate')
     || hasPermission(req.user, 'dailyClosing', 'dailyOpeningEdit')

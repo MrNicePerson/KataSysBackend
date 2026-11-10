@@ -661,7 +661,8 @@ export function updatePurchase(database, input) {
     stockMovements,
     auditHistory: addAudit(database, 'purchase-edit', purchase.id, `Receive stock ${purchase.batchNumber || purchase.id} updated`),
   }
-  return { database: next, record: updatedPurchase }
+  const changedProductIds = new Set([...items, ...removedItems].map((item) => item.productId).filter(Boolean))
+  return { database: next, record: { ...updatedPurchase, updatedProducts: products.filter((product) => changedProductIds.has(product.id)) } }
 }
 
 function appendPurchaseItems(database, purchase, input) {
