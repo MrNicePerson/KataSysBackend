@@ -1837,21 +1837,33 @@ export function receiveInstallmentPayment(database, input) {
 export function updateProductDetails(database, input) {
   const product = database.products.find((entry) => entry.id === input.productId)
   if (!product) throw new Error('Product could not be found.')
+  if (input.expectedStockQuantity != null && Number(input.expectedStockQuantity) !== Number(product.stockQuantity || 0)) throw new Error('Stock changed while you were editing. Refresh and try again.')
+  if (input.active === false && (Number(product.stockQuantity || 0) > 0 || Number(product.reservedQuantity || 0) > 0 || Number(product.defectiveQuantity || 0) > 0)) throw new Error('Remove or resolve all stock, reservations and defective units before deleting this product.')
   if (input.name != null && !String(input.name).trim()) throw new Error('Product name is required.')
+  const salePrice = input.salePrice == null ? product.salePrice : amountOf(input.salePrice)
+  const averageCost = input.averageCost == null ? product.averageCost : amountOf(input.averageCost)
+  let working = database
+  if (input.stockQuantity != null) {
+    const target = nonnegativeWholeQuantity(input.stockQuantity)
+    const delta = target - Number(product.stockQuantity || 0)
+    if (delta) working = adjustStock(database, { productId: product.id, quantity: Math.abs(delta), direction: delta > 0 ? 'add' : 'remove', reason: 'Stock edited from Stock & products' }).database
+  }
+  const current = working.products.find((entry) => entry.id === product.id)
   const updated = {
-    ...product,
+    ...current,
     name: input.name == null ? product.name : String(input.name).trim(),
     code: input.code == null ? product.code : String(input.code).trim(),
     article: input.article == null ? product.article : String(input.article).trim(),
     rackLocation: input.rackLocation == null ? product.rackLocation : String(input.rackLocation).trim(),
-    salePrice: input.salePrice == null ? product.salePrice : amountOf(input.salePrice),
-    averageCost: input.averageCost == null ? product.averageCost : amountOf(input.averageCost),
+    salePrice,
+    averageCost,
+    ...(product.productType === 'tan' && Number(product.metersPerTan) > 0 ? { salePricePerMeter: Number(salePrice || 0) / Number(product.metersPerTan), buyPricePerMeter: Number(averageCost || 0) / Number(product.metersPerTan) } : {}),
     labels: input.labels == null ? product.labels || [] : input.labels,
     active: input.active == null ? product.active : Boolean(input.active),
     size: input.size == null ? product.size : String(input.size).trim(),
     color: input.color == null ? product.color : String(input.color).trim(),
   }
-  const next = { ...database, products: database.products.map((entry) => entry.id === product.id ? updated : entry), auditHistory: addAudit(database, 'product-update', product.id, `Product ${updated.name} updated`) }
+  const next = { ...working, products: working.products.map((entry) => entry.id === product.id ? updated : entry), auditHistory: addAudit(working, 'product-update', product.id, `Product ${updated.name} updated`) }
   return { database: next, record: updated }
 }
 
