@@ -7,6 +7,31 @@ import { appendAuditEntry, getSnapshot } from '../store/snapshotStore.js'
 
 export const authRouter = Router()
 
+export async function changePasswordForUser(user, { oldPassword, newPassword }) {
+  if (!oldPassword || !newPassword) {
+    const error = new Error('Old and new passwords are required.')
+    error.status = 400
+    throw error
+  }
+  if (!(await bcrypt.compare(String(oldPassword), user.passwordHash))) {
+    const error = new Error('Old password is incorrect.')
+    error.status = 400
+    throw error
+  }
+  if (String(newPassword).length < 12) {
+    const error = new Error('New password must be at least 12 characters long.')
+    error.status = 400
+    throw error
+  }
+  if (newPassword === oldPassword) {
+    const error = new Error('New password must be different from the old password.')
+    error.status = 400
+    throw error
+  }
+  user.passwordHash = await bcrypt.hash(String(newPassword), 10)
+  await user.save()
+}
+
 authRouter.get('/bootstrap', asyncHandler(async (_req, res) => {
   const [userCount, snapshot] = await Promise.all([User.countDocuments(), getSnapshot()])
   res.json({ registrationAvailable: userCount === 0, language: snapshot.settings.language === 'ur' ? 'ur' : 'en' })
@@ -62,6 +87,19 @@ authRouter.post('/login', asyncHandler(async (req, res) => {
 authRouter.get('/me', authRequired, (req, res) => {
   res.json({ user: currentUserPayload(req.user) })
 })
+
+authRouter.post('/change-password', authRequired, asyncHandler(async (req, res) => {
+  await changePasswordForUser(req.user, {
+    oldPassword: String(req.body?.oldPassword || ''),
+    newPassword: String(req.body?.newPassword || ''),
+  })
+  await appendAuditEntry({
+    type: 'password-changed',
+    referenceId: String(req.user._id),
+    description: `${req.user.name} changed their password`,
+  }, req.user).catch((error) => console.error('Could not log password change:', error.message))
+  res.json({ data: { changed: true } })
+}))
 
 authRouter.post('/logout', authRequired, asyncHandler(async (req, res) => {
   await appendAuditEntry({ type: 'logout', referenceId: String(req.user._id), description: `${req.user.name} signed out` }, req.user)

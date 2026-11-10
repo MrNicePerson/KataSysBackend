@@ -25,11 +25,28 @@ test('supplier codes, receiving sequences and stock trace survive application re
       { productName: 'Product A', quantity: 2, unitCost: 100, salePrice: 150 },
       { productName: 'Product B', quantity: 3, unitCost: 200, salePrice: 250 },
     ])
+    const appended = await runCommand('update-purchase', {
+      purchaseId: first.id,
+      supplierId: ali.id,
+      appendStock: true,
+      appendIdempotencyKey: 'append-product-c-once',
+      appendItems: [{ productName: 'Product C', quantity: 2, unitCost: 70, salePrice: 110 }],
+    })
+    const retriedAppend = await runCommand('update-purchase', {
+      purchaseId: first.id,
+      supplierId: ali.id,
+      appendStock: true,
+      appendIdempotencyKey: 'append-product-c-once',
+      appendItems: [{ productName: 'Product C', quantity: 2, unitCost: 70, salePrice: 110 }],
+    })
     const second = await receive(ali.id, '2026-10-03', [{ productName: 'Product C', quantity: 1, unitCost: 300, salePrice: 400 }])
     const otherFirst = await receive(other.id, '2026-10-03', [{ productName: 'Product D', quantity: 4, unitCost: 50, salePrice: 90 }])
     const third = await receive(ali.id, '2026-10-05', [{ productName: 'Product E', quantity: 5, unitCost: 70, salePrice: 110 }])
+    assert.equal(appended.id, first.id)
+    assert.equal(appended.items.length, 3)
+    assert.equal(retriedAppend.items.length, 3)
     assert.deepEqual([first.batchNumber, second.batchNumber, otherFirst.batchNumber, third.batchNumber], [
-      'AA-03102026-001', 'AA-03102026-002', 'BB-03102026-001', 'AA-05102026-003',
+      'AA-03102026-001', 'AA-03102026-003', 'BB-03102026-001', 'AA-05102026-004',
     ])
     assert.equal(first.items.length, 2)
     assert.ok(first.items.every((item) => item.batchNumber === first.batchNumber))
@@ -48,12 +65,14 @@ test('supplier codes, receiving sequences and stock trace survive application re
     assert.equal(savedBill.supplierCode, 'AA')
     assert.equal(savedSupplier.name, 'Ali Imran')
     assert.equal(savedBill.date, '2026-10-03')
-    assert.equal(savedBill.items.length, 2)
-    assert.equal(savedBill.total, 800)
-    assert.equal(savedProducts.length, 2)
+    assert.equal(savedBill.items.length, 3)
+    assert.equal(savedBill.total, 940)
+    assert.equal(savedProducts.length, 3)
+    assert.notEqual(savedBill.items[2].batchNumber, savedBill.batchNumber)
     for (const product of savedProducts) {
-      assert.equal(product.batchNumber, savedBill.batchNumber)
-      assert.ok(savedBill.items.some((item) => item.productId === product.id))
+      const linkedItem = savedBill.items.find((item) => item.productId === product.id)
+      assert.ok(linkedItem)
+      assert.equal(product.batchNumber, linkedItem.batchNumber)
     }
   } finally {
     if (mongoose.connection.readyState === 1 && mongoose.connection.name === dbName) await mongoose.connection.dropDatabase()

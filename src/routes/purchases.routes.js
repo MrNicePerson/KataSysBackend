@@ -32,3 +32,12 @@ purchasesRouter.get('/:id', (req, res) => {
 })
 
 purchasesRouter.post('/', mutate('receive-purchase'))
+purchasesRouter.post('/tan-types', mutate('create-tan-type'))
+purchasesRouter.patch('/:id', (req, res, next) => {
+  const purchase = req.database.purchases.find((entry) => entry.id === req.params.id)
+  if (!req.body?.appendStock && purchase && Array.isArray(req.body?.items) && req.body.items.length < purchase.items.length) return requirePermission('purchases', 'delete')(req, res, next)
+  next()
+}, mutate('update-purchase', {
+  status: 200,
+  input: (req) => ({ ...req.body, purchaseId: req.params.id }),
+}))

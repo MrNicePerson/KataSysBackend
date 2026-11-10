@@ -1,3 +1,4 @@
+import mongoose from 'mongoose'
 import { createEmptyDatabase, runDatabaseCommand } from '../domain/businessLogic.js'
 import { ARRAY_COLLECTIONS, OBJECT_KEYS, Meta, collectionModels } from '../models/documents.js'
 
@@ -49,25 +50,38 @@ export async function getSnapshot() {
   return cache
 }
 
-async function persistSnapshot(snapshot) {
-  // Validate before this legacy snapshot writer replaces any collections.
+function validateSnapshot(snapshot) {
   const batches = new Set()
   for (const purchase of snapshot.purchases || []) {
     if (!purchase.batchNumber) continue
     if (batches.has(purchase.batchNumber)) throw new Error('This receiving Batch Number already exists.')
     batches.add(purchase.batchNumber)
   }
-  await Promise.all(ARRAY_COLLECTIONS.map(async (name) => {
+}
+
+async function persistSnapshot(snapshot, session = null) {
+  validateSnapshot(snapshot)
+  const persistCollection = async (name) => {
     const Model = collectionModels[name]
-    await Model.deleteMany({})
-    if (snapshot[name]?.length) await Model.insertMany(snapshot[name], { ordered: false })
-  }))
-  await Promise.all(OBJECT_KEYS.map((key) => Meta.replaceOne(
-    { id: key },
-    { id: key, value: snapshot[key] || {} },
-    { upsert: true },
-  )))
-  cache = snapshot
+    await Model.deleteMany({}, session ? { session } : {})
+    if (snapshot[name]?.length) await Model.insertMany(snapshot[name], { ordered: false, ...(session ? { session } : {}) })
+  }
+  if (session) {
+    for (const name of ARRAY_COLLECTIONS) await persistCollection(name)
+    for (const key of OBJECT_KEYS) await Meta.replaceOne(
+      { id: key },
+      { id: key, value: snapshot[key] || {} },
+      { upsert: true, session },
+    )
+  } else {
+    await Promise.all(ARRAY_COLLECTIONS.map(persistCollection))
+    await Promise.all(OBJECT_KEYS.map((key) => Meta.replaceOne(
+      { id: key },
+      { id: key, value: snapshot[key] || {} },
+      { upsert: true },
+    )))
+  }
+  if (!session) cache = snapshot
 }
 
 async function persistBulkRecovery(current, next) {
@@ -129,8 +143,27 @@ export async function runCommand(command, input = {}, actor = null) {
         return { ...entry, module, action, userId: String(actor._id || actor.id || ''), userName: actor.name || '' }
       })
     }
-    if (command === 'bulk-recovery') await persistBulkRecovery(current, result.database)
-    else await persistSnapshot(result.database)
+    if (command === 'bulk-recovery') {
+      await persistBulkRecovery(current, result.database)
+    } else {
+      const topologyType = mongoose.connection.getClient()?.topology?.description?.type
+      if (topologyType === 'ReplicaSetWithPrimary' || topologyType === 'Sharded') {
+        const session = await mongoose.startSession()
+        try {
+          await session.withTransaction(async () => {
+            await persistSnapshot(result.database, session)
+          })
+          cache = result.database
+        } catch (error) {
+          cache = null
+          throw error
+        } finally {
+          await session.endSession()
+        }
+      } else {
+        await persistSnapshot(result.database)
+      }
+    }
     return result.record
   })
 }

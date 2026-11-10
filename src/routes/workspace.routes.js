@@ -6,6 +6,7 @@ import { send } from './helpers.js'
 
 const collectionPermissions = {
   products: ['stock', 'sales', 'returns', 'orders', 'reports'],
+  tanTypes: ['stock'],
   categories: ['stock', 'reports'],
   customers: ['customers', 'sales', 'returns', 'orders', 'reports'],
   suppliers: ['suppliers', 'stock', 'reports'],

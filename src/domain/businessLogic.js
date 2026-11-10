@@ -1,3 +1,4 @@
+import { requireDate, returnRefundAmount, validateBackupNumbers } from './inputValidation.js'
 import { nextReceivingBatch, receivingLabel } from './receiving.js'
 
 export const APP_DB_VERSION = 2
@@ -6,6 +7,7 @@ export function createEmptyDatabase() {
   return {
     version: APP_DB_VERSION,
     products: [],
+    tanTypes: [],
     categories: [],
     customers: [],
     suppliers: [],
@@ -60,7 +62,7 @@ export function assertSaleDayOpen(database, context = {}) {
   if (!status.canCreateSale) throw new Error(status.reason)
   return status
 }
-const dateOf = (value) => value || localDateString()
+const dateOf = (value) => requireDate(value || localDateString())
 const amountOf = (value) => {
   const amount = Number(value)
   if (!Number.isFinite(amount) || amount < 0) throw new Error('Amounts must be zero or greater.')
@@ -78,7 +80,7 @@ const nonnegativeWholeQuantity = (value) => {
   return quantity
 }
 const makeId = (prefix) => `${prefix}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`
-const record = (prefix, values) => ({ id: makeId(prefix), createdAt: now(), ...values })
+const record = (prefix, values) => ({ createdAt: now(), ...values, id: makeId(prefix) })
 export function receivingBatchNumber(database, supplier, date) {
   return nextReceivingBatch(database, supplier, date).batchNumber
 }
@@ -133,8 +135,38 @@ function validateSplits(total, payments) {
   return { cash, bank, cheque, credit: Math.max(0, total - cash - bank) }
 }
 
-export function createSale(database, input) {
+export function createSale(database, input, { actor = null } = {}) {
   if (!Array.isArray(input.items) || input.items.length === 0) throw new Error('Add at least one item before saving the sale.')
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const idempotencyFingerprint = idempotencyKey ? JSON.stringify({
+    customerId: input.customerId || null,
+    items: input.items.map((item) => ({
+      productId: item.productId || null,
+      quantity: item.quantity,
+      price: item.price ?? item.unitPrice,
+      isReturn: Boolean(item.isReturn || item.returnQuantity),
+      returnQuantity: item.returnQuantity,
+      originalSaleId: item.originalSaleId || null,
+      originalSaleLineId: item.originalSaleLineId || null,
+      returnCondition: item.returnCondition || '',
+    })),
+    discount: input.discount ?? 0,
+    payments: {
+      cash: input.payments?.cash ?? 0,
+      bank: input.payments?.bank ?? input.payments?.bankTransfer ?? 0,
+      cheque: input.payments?.cheque ?? 0,
+    },
+    bankDetails: input.bankDetails || null,
+    cheque: input.cheque || null,
+    refundType: input.refundType || 'cash',
+  }) : ''
+  if (idempotencyKey) {
+    const existing = database.sales.find((sale) => sale.idempotencyKey === idempotencyKey)
+    if (existing) {
+      if (existing.idempotencyFingerprint !== idempotencyFingerprint) throw new Error('This sale submission key was already used for different transaction details.')
+      return { database, record: existing }
+    }
+  }
   const saleInputs = input.items.filter((item) => !item.isReturn)
   const returnInputs = input.items.filter((item) => item.isReturn || item.returnQuantity)
   const saleItems = saleInputs.map((item) => {
@@ -143,7 +175,10 @@ export function createSale(database, input) {
     const unitPrice = amountOf(item.price ?? item.unitPrice ?? product.salePrice)
     const reserved = Number(product.reservedQuantity || 0)
     if (Number(product.stockQuantity || 0) - reserved < quantity) throw new Error(`Not enough available stock for ${product.name}.`)
-    return { lineId: makeId('line'), productId: product.id, code: product.code ?? '', name: product.name, quantity, price: unitPrice, unitPrice, unitCostAtSale: Number(product.averageCost || 0), lineTotal: quantity * unitPrice }
+    if (product.productType === 'tan' && (!(Number(product.metersPerTan) > 0) || !(Number(product.salePricePerMeter) >= 0))) throw new Error('Tan stock is missing valid length or price details.')
+    const tan = product.productType === 'tan'
+    const lineTotal = tan ? quantity * Number(product.metersPerTan) * unitPrice : quantity * unitPrice
+    return { lineId: makeId('line'), productId: product.id, code: product.code ?? '', name: product.name, productType: tan ? 'tan' : 'suit', tanType: product.tanType || '', batchNumber: product.batchNumber || '', metersPerTan: tan ? Number(product.metersPerTan) : undefined, quantity, price: unitPrice, unitPrice, unitCostAtSale: Number(product.averageCost || 0), lineTotal }
   })
   const subtotal = saleItems.reduce((sum, item) => sum + item.lineTotal, 0)
   for (const product of database.products) {
@@ -160,18 +195,22 @@ export function createSale(database, input) {
     const quantity = positiveQuantity(item.returnQuantity ?? item.quantity)
     const alreadyReturned = database.returns.filter((entry) => entry.saleId === originalSale.id && (entry.lineId ? entry.lineId === originalItem.lineId : entry.productId === originalItem.productId)).reduce((sum, entry) => sum + Number(entry.quantity || 0), 0)
     if (alreadyReturned + quantity > originalItem.quantity) throw new Error('Return quantity exceeds the amount sold and not yet returned.')
-    return { originalSale, originalItem, quantity, condition: item.returnCondition || 'sellable', amount: quantity * Number(originalItem.unitPrice ?? originalItem.price ?? 0) }
+    return { originalSale, originalItem, quantity, condition: item.returnCondition || 'sellable', amount: returnRefundAmount(originalSale, originalItem, quantity, alreadyReturned) }
   })
   for (let i = 0; i < returnItems.length; i += 1) {
     const current = returnItems.slice(0, i).filter((entry) => entry.originalItem.lineId === returnItems[i].originalItem.lineId && entry.originalSale.id === returnItems[i].originalSale.id).reduce((sum, entry) => sum + entry.quantity, 0)
     const already = database.returns.filter((entry) => entry.saleId === returnItems[i].originalSale.id && entry.lineId === returnItems[i].originalItem.lineId).reduce((sum, entry) => sum + Number(entry.quantity || 0), 0)
     if (already + current + returnItems[i].quantity > returnItems[i].originalItem.quantity) throw new Error('Combined return quantities exceed the amount sold.')
+    returnItems[i].amount = returnRefundAmount(returnItems[i].originalSale, returnItems[i].originalItem, returnItems[i].quantity, already + current)
   }
   const discount = amountOf(input.discount ?? 0)
   if (discount > subtotal) throw new Error('Discount cannot exceed the subtotal.')
   const returnTotal = returnItems.reduce((sum, item) => sum + item.amount, 0)
-  const total = subtotal - discount - returnTotal
-  if (total < 0) throw new Error('Returns cannot exceed the new sale total. Process a cash or khata refund from Customer returns instead.')
+  const saleTotal = subtotal - discount
+  const settlementBalance = saleTotal - returnTotal
+  const total = Math.max(0, settlementBalance)
+  const refundDue = Math.max(0, -settlementBalance)
+  const refundType = input.refundType === 'cash' ? 'cash' : 'khata'
   const split = validateSplits(total, input.payments)
   if (split.cash + split.bank + split.cheque > total + 0.005) throw new Error('Combined cash, bank and cheque payments cannot exceed the bill total.')
   if (split.credit > 0 && !input.customerId) throw new Error('Choose a customer before saving a sale with an unpaid balance.')
@@ -190,11 +229,15 @@ export function createSale(database, input) {
     customerPhone: input.customerPhone || '',
     customerAddress: input.customerAddress || '',
     padInvoiceNumber: input.padInvoiceNumber || input.paidInvoiceNumber || '',
-    items: [...saleItems, ...returnItems.map(({ originalSale, originalItem, quantity, condition, amount }) => ({ lineId: makeId('line'), productId: originalItem.productId, code: originalItem.code, name: `Return · ${originalItem.name}`, quantity, price: -amount / quantity, unitPrice: -amount / quantity, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), lineTotal: -amount, isReturn: true, returnCondition: condition, originalSaleId: originalSale.id, originalSaleLineId: originalItem.lineId }))],
+    items: [...saleItems, ...returnItems.map(({ originalSale, originalItem, quantity, condition, amount }) => ({ lineId: makeId('line'), productId: originalItem.productId, code: originalItem.code, name: `Return · ${originalItem.name}`, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || '', metersPerTan: originalItem.metersPerTan, quantity, price: originalItem.productType === 'tan' ? -Number(originalItem.price ?? originalItem.unitPrice ?? 0) : -amount / quantity, unitPrice: originalItem.productType === 'tan' ? -Number(originalItem.unitPrice ?? originalItem.price ?? 0) : -amount / quantity, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), lineTotal: -amount, isReturn: true, returnCondition: condition, originalSaleId: originalSale.id, originalSaleLineId: originalItem.lineId }))],
     subtotal,
     discount,
     returnTotal,
+    saleTotal,
     total,
+    refundDue,
+    refundType: refundDue > 0 ? refundType : '',
+    ...(idempotencyKey ? { idempotencyKey, idempotencyFingerprint } : {}),
     payments: { cash: split.cash, bank: split.bank, cheque: split.cheque },
     bankDetails,
     paid: split.cash + split.bank,
@@ -211,15 +254,45 @@ export function createSale(database, input) {
   let stockMovements = database.stockMovements
   for (const item of saleItems) stockMovements = addMovement({ ...database, stockMovements }, { productId: item.productId, type: 'sale', quantity: -item.quantity, referenceId: sale.id, date: sale.date, note: sale.number || 'Sale' })
   let returnRecords = []
+  let claims = database.claims
   for (const item of returnItems) {
-    const returnRecord = record('return', { saleId: item.originalSale.id, saleNumber: item.originalSale.number, adjustmentSaleId: sale.id, customerId: item.originalSale.customerId, productId: item.originalItem.productId, lineId: item.originalItem.lineId, code: item.originalItem.code, itemName: item.originalItem.name, quantity: item.quantity, unitPrice: item.amount / item.quantity, amount: item.amount, condition: item.condition, refundType: 'sale-adjustment', date: sale.date })
+    const returnRecord = record('return', { saleId: item.originalSale.id, saleNumber: item.originalSale.number, adjustmentSaleId: sale.id, customerId: item.originalSale.customerId, productId: item.originalItem.productId, lineId: item.originalItem.lineId, code: item.originalItem.code, itemName: item.originalItem.name, productType: item.originalItem.productType || 'suit', tanType: item.originalItem.tanType || '', batchNumber: item.originalItem.batchNumber || '', metersPerTan: item.originalItem.metersPerTan, quantity: item.quantity, unitPrice: item.amount / item.quantity, amount: item.amount, condition: item.condition, refundType: refundDue > 0 ? refundType : 'sale-adjustment', date: sale.date })
     returnRecords.push(returnRecord)
     stockMovements = addMovement({ ...database, stockMovements }, { productId: item.originalItem.productId, type: item.condition === 'sellable' ? 'customer-return' : 'customer-return-defective', quantity: item.quantity, referenceId: returnRecord.id, date: sale.date, note: item.originalSale.number })
+    if (item.condition === 'damaged') {
+      const product = database.products.find((entry) => entry.id === item.originalItem.productId)
+      const claim = record('claim', {
+        productId: item.originalItem.productId,
+        productName: item.originalItem.name,
+        quantity: item.quantity,
+        amount: 0,
+        description: `Defective product returned by customer on sale ${item.originalSale.number || item.originalSale.id}`,
+        date: sale.date,
+        status: 'Pending',
+        physicalStatus: 'quarantine',
+        financialStatus: 'not-applicable',
+        sourceType: 'customer-return',
+        sourceReturnId: returnRecord.id,
+        sourceSaleId: item.originalSale.id,
+        saleNumber: item.originalSale.number || '',
+        customerId: item.originalSale.customerId || null,
+        customer: item.originalSale.customer || '',
+        supplierId: product?.supplierId || null,
+        supplier: database.suppliers.find((entry) => entry.id === product?.supplierId)?.name || '',
+        inventoryManagedBySource: true,
+        createdById: String(actor?._id || actor?.id || ''),
+        createdByName: actor?.name || '',
+      })
+      claims = [claim, ...claims]
+    }
   }
   let customers = database.customers
-  if (sale.customerId && split.credit > 0) customers = updateBalance(customers, sale.customerId, split.credit)
-  let next = { ...database, products, customers, sales: [sale, ...database.sales], returns: [...returnRecords, ...database.returns], stockMovements }
+  if (sale.customerId && (split.credit > 0 || refundType === 'khata' && refundDue > 0)) {
+    customers = updateBalance(customers, sale.customerId, split.credit - (refundType === 'khata' ? refundDue : 0))
+  }
+  let next = { ...database, products, customers, sales: [sale, ...database.sales], returns: [...returnRecords, ...database.returns], claims, stockMovements }
   if (split.cash > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'cash', amount: split.cash, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
+  if (refundDue > 0 && refundType === 'cash') next = { ...next, payments: addPayment(next, { type: 'customer-refund', method: 'cash', amount: refundDue, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
   if (split.bank > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'bank', amount: split.bank, bankDetails, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
   if (split.cheque > 0) next = { ...next, cheques: [record('cheque', { direction: 'received', partyType: 'customer', partyId: sale.customerId, party: sale.customer, amount: split.cheque, issued: input.cheque?.chequeDate || input.cheque?.issued || sale.date, bank: input.cheque?.bank || input.cheque?.bankName || '', number: input.cheque?.number || input.cheque?.chequeNumber || '', expectedClearanceDate: input.cheque?.dueDate || input.cheque?.expectedClearanceDate || '', sourceType: 'sale', referenceId: sale.id, status: 'Pending' }), ...next.cheques] }
   next = { ...next, counters: { ...next.counters, sale: (next.counters.sale || 0) + 1 }, auditHistory: addAudit(next, 'sale', sale.id, `Sale ${sale.number || sale.id} recorded`) }
@@ -227,6 +300,35 @@ export function createSale(database, input) {
 }
 
 export function receivePurchase(database, input) {
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const idempotencyFingerprint = idempotencyKey ? JSON.stringify({
+    supplierId: input.supplierId,
+    date: dateOf(input.date ?? input.arrivalDate),
+    padNumber: String(input.padNumber ?? '').trim(),
+    items: (input.items || []).map((item) => ({
+      productId: item.productId || null,
+      existingProductId: item.existingProductId || null,
+      productName: item.productName ?? item.name ?? '',
+      code: item.code ?? item.articleNumber ?? '',
+      padNumber: item.padNumber ?? '',
+      size: item.size ?? '',
+      quantity: item.quantity,
+      unitCost: item.unitCost ?? item.cost ?? 0,
+      salePrice: item.salePrice ?? 0,
+      season: item.season || '',
+      rackLocation: item.rackLocation ?? item.location ?? '',
+    })),
+    payments: input.payments || {},
+    bankDetails: input.bankDetails || null,
+    cheques: input.cheques || [],
+  }) : ''
+  if (idempotencyKey) {
+    const existing = database.purchases.find((entry) => entry.idempotencyKey === idempotencyKey)
+    if (existing) {
+      if (existing.idempotencyFingerprint !== idempotencyFingerprint) throw new Error('This receiving submission key was already used for different delivery details.')
+      return { database, record: existing }
+    }
+  }
   if (!input.supplierId) throw new Error('Choose a supplier before saving the purchase.')
   if (!Array.isArray(input.items) || input.items.length === 0) throw new Error('Add at least one stock item before saving the purchase.')
   const supplier = database.suppliers.find((entry) => entry.id === input.supplierId)
@@ -236,16 +338,33 @@ export function receivePurchase(database, input) {
   const purchaseItems = input.items.map((item) => ({
     lineId: item.lineId || makeId('purchase-line'),
     productId: item.productId || null,
+    existingProductId: item.existingProductId || null,
     productName: String(item.productName ?? item.name ?? item.code ?? item.articleNumber ?? '').trim(),
+    ...(item.brandName != null ? { brandName: String(item.brandName).trim() } : {}),
     code: String(item.code ?? item.articleNumber ?? '').trim(),
     batchNumber: generatedBatchNumber,
+    padNumber: String(item.padNumber ?? input.padNumber ?? '').trim(),
     size: String(item.size ?? '').trim(),
     season: String(item.season ?? '').trim(),
     rackLocation: String(item.rackLocation ?? item.location ?? '').trim(),
     quantity: positiveQuantity(item.quantity),
     unitCost: amountOf(item.unitCost ?? item.cost ?? 0),
     salePrice: amountOf(item.salePrice ?? 0),
+    productType: item.productType === 'tan' ? 'tan' : 'suit',
+    tanType: String(item.tanType || '').trim(),
+    tanName: String(item.tanName || '').trim(),
+    metersPerTan: item.productType === 'tan' ? Number(item.metersPerTan ?? item.totalMeters) : undefined,
+    buyPricePerMeter: item.productType === 'tan' ? Number(item.buyPricePerMeter) : undefined,
+    salePricePerMeter: item.productType === 'tan' ? Number(item.salePricePerMeter) : undefined,
   }))
+  for (const item of purchaseItems) if (item.productType === 'tan') {
+    if (!item.tanType || !item.tanName) throw new Error('Tan type and name are required.')
+    if (!Number.isFinite(item.metersPerTan) || item.metersPerTan <= 0) throw new Error('Tan length must be greater than zero meters per Tan.')
+    if (!Number.isFinite(item.unitCost) || item.unitCost < 0 || !Number.isFinite(item.salePrice) || item.salePrice < 0) throw new Error('Tan prices must be valid and non-negative.')
+    item.productName = item.tanName
+    item.buyPricePerMeter = item.unitCost / item.metersPerTan
+    item.salePricePerMeter = item.salePrice / item.metersPerTan
+  }
   if (purchaseItems.some((item) => item.productId && !database.products.some((product) => product.id === item.productId))) throw new Error('A delivery item points to a stock product that no longer exists.')
   if (purchaseItems.some((item) => !item.productName && (!item.productId || !database.products.some((product) => product.id === item.productId)))) throw new Error('Each delivery item needs an existing product or a product name/article number.')
   const total = purchaseItems.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
@@ -272,6 +391,7 @@ export function receivePurchase(database, input) {
     bankDetails = { bankName, accountNumber, amount: bank }
   }
   const purchase = record('purchase', {
+    ...(idempotencyKey ? { idempotencyKey, idempotencyFingerprint } : {}),
     batchNumber: generatedBatchNumber,
     supplierBillNumber,
     padNumber: String(input.padNumber ?? '').trim(),
@@ -290,18 +410,26 @@ export function receivePurchase(database, input) {
   let products = [...database.products]
   let stockMovements = database.stockMovements
   for (const item of purchaseItems) {
-    const sameBatch = (entry) =>
+    const sameBatch = (entry) => item.productType !== 'tan' && entry.productType !== 'tan' &&
       entry.supplierId === supplier.id &&
       String(entry.batchNumber || '').trim().toLowerCase() === item.batchNumber.toLowerCase()
-    const sourceProduct = item.productId ? products.find((entry) => entry.id === item.productId) : null
+    const reusesExistingProduct = Boolean(item.existingProductId)
+    const selectedExistingProduct = reusesExistingProduct ? products.find((entry) => entry.id === item.existingProductId) : null
+    if (reusesExistingProduct && !selectedExistingProduct) throw new Error('The selected existing stock product could not be found.')
+    if (selectedExistingProduct?.supplierId && selectedExistingProduct.supplierId !== supplier.id) throw new Error('Choose an existing product belonging to the selected supplier.')
+    const sourceProduct = (item.productId || item.existingProductId)
+      ? products.find((entry) => entry.id === (item.productId || item.existingProductId))
+      : null
     if (sourceProduct) {
       item.productName ||= sourceProduct.name
       item.code ||= sourceProduct.code
       item.size ||= sourceProduct.size || ''
       item.rackLocation ||= sourceProduct.rackLocation || ''
     }
-    let product = item.productId
-      ? products.find((entry) => entry.id === item.productId && sameBatch(entry))
+    let product = item.productType === 'tan' ? null : reusesExistingProduct
+      ? selectedExistingProduct
+      : item.productId
+        ? products.find((entry) => entry.id === item.productId && sameBatch(entry))
       : products.find((entry) => item.code && entry.code?.toLowerCase() === item.code.toLowerCase() && sameBatch(entry))
     if (!product && item.productName) product = products.find((entry) => entry.name.toLowerCase() === item.productName.toLowerCase() && sameBatch(entry))
     if (product) {
@@ -311,22 +439,20 @@ export function receivePurchase(database, input) {
         stockQuantity: Number(entry.stockQuantity || 0) + item.quantity,
         averageCost: ((Number(entry.stockQuantity || 0) * Number(entry.averageCost || 0)) + (item.quantity * item.unitCost)) / (Number(entry.stockQuantity || 0) + item.quantity || 1),
         salePrice: item.salePrice || Number(entry.salePrice || 0),
-        supplierId: supplier.id,
-        batchNumber: purchase.batchNumber,
-        purchaseId: purchase.id,
-        arrivalDate: purchase.date,
+        ...(!entry.supplierId ? { supplierId: supplier.id } : {}),
+        ...(!reusesExistingProduct && !item.productId ? { batchNumber: purchase.batchNumber, purchaseId: purchase.id, arrivalDate: purchase.date } : {}),
         size: item.size || entry.size || '',
         season: item.season || entry.season || '',
         rackLocation: item.rackLocation || entry.rackLocation,
       } : entry)
-      stockMovements = addMovement({ ...database, stockMovements }, { productId: product.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: purchase.batchNumber })
+      stockMovements = addMovement({ ...database, stockMovements }, { productId: product.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: item.batchNumber })
     } else {
-      const newProduct = record('product', { name: item.productName, code: item.code || makeId('sku'), categoryId: null, size: item.size, season: item.season, stockQuantity: item.quantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: item.unitCost, salePrice: item.salePrice, supplierId: supplier.id, batchNumber: item.batchNumber, rackLocation: item.rackLocation, active: true })
+      const newProduct = record('product', { name: item.productName, code: item.code || makeId('sku'), categoryId: null, size: item.size, season: item.season, stockQuantity: item.quantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: item.unitCost, salePrice: item.salePrice, supplierId: supplier.id, batchNumber: item.batchNumber, rackLocation: item.rackLocation, active: true, ...(item.productType === 'tan' ? { productType: 'tan', tanType: item.tanType, metersPerTan: item.metersPerTan, buyPricePerMeter: item.buyPricePerMeter, salePricePerMeter: item.salePricePerMeter } : {}) })
       newProduct.purchaseId = purchase.id
       newProduct.arrivalDate = purchase.date
       products.push(newProduct)
       purchaseItems[purchaseItems.indexOf(item)] = { ...item, productId: newProduct.id }
-      stockMovements = addMovement({ ...database, stockMovements }, { productId: newProduct.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: purchase.batchNumber })
+      stockMovements = addMovement({ ...database, stockMovements }, { productId: newProduct.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: item.batchNumber })
     }
   }
   for (const item of purchaseItems) item.productName = item.productName || products.find((product) => product.id === item.productId)?.name || ''
@@ -337,8 +463,335 @@ export function receivePurchase(database, input) {
   if (cash > 0) next = { ...next, payments: addPayment(next, { type: 'supplier-payment', method: 'cash', amount: cash, supplierId: supplier.id, referenceId: purchase.id, date: purchase.date }) }
   if (bank > 0) next = { ...next, payments: addPayment(next, { type: 'supplier-payment', method: 'bank', amount: bank, bankDetails, supplierId: supplier.id, referenceId: purchase.id, date: purchase.date }) }
   if (cheque > 0) next = { ...next, payments: addPayment(next, { type: 'supplier-payment', method: 'cheque', amount: cheque, supplierId: supplier.id, referenceId: purchase.id, date: purchase.date }), cheques: [...chequeEntries.map((entry) => record('cheque', { direction: 'given', partyType: 'supplier', partyId: supplier.id, party: supplier.name, ...entry, referenceId: purchase.id, sourceType: 'purchase', appliedToBalance: true, status: 'Pending' })), ...next.cheques] }
-  next = { ...next, counters: { ...next.counters, supplierReceivings: { ...next.counters?.supplierReceivings, [supplier.id]: supplierBillNumber } }, auditHistory: addAudit(next, 'purchase', purchase.id, `Receive stock ${purchase.batchNumber} recorded`) }
+  next = { ...next,     counters: { ...next.counters, supplierReceivings: { ...next.counters?.supplierReceivings, [supplier.id]: supplierBillNumber } }, auditHistory: addAudit(next, 'purchase', purchase.id, `Receive stock ${purchase.batchNumber} recorded`) }
   return { database: next, record: purchase }
+}
+
+export function updatePurchase(database, input) {
+  const purchase = database.purchases.find((entry) => entry.id === input.purchaseId)
+  if (!purchase) throw new Error('Purchase could not be found.')
+  if (input.appendStock === true) return appendPurchaseItems(database, purchase, input)
+  if (input.supplierId && input.supplierId !== purchase.supplierId) throw new Error('A received purchase cannot be moved to another supplier.')
+  if (database.supplierReturns.some((entry) => entry.purchaseId === purchase.id)) throw new Error('This delivery has supplier returns and cannot be edited safely.')
+  if (!Array.isArray(input.items) || input.items.length > purchase.items.length) throw new Error('Delivery item lines must match the saved bill.')
+  const originalByLine = new Map(purchase.items.map((item, index) => [item.lineId || `legacy-line-${index}`, item]))
+  const seenLineIds = new Set()
+  const items = input.items.map((submitted) => {
+    const lineId = String(submitted.lineId || '')
+    const original = originalByLine.get(lineId)
+    if (!original || seenLineIds.has(lineId)) throw new Error('Delivery item lines must match the saved bill.')
+    seenLineIds.add(lineId)
+    const product = database.products.find((entry) => entry.id === original.productId) || database.products.find((entry) =>
+      entry.supplierId === purchase.supplierId
+      && String(entry.batchNumber || '').toLowerCase() === String(original.batchNumber || purchase.batchNumber || '').toLowerCase()
+      && (original.code && entry.code === original.code || original.productName && entry.name === original.productName))
+    if (!product) throw new Error('A delivery stock product could not be found.')
+    if (submitted.productId && submitted.productId !== product.id) throw new Error('A received item cannot be reassigned to a different stock product.')
+    return {
+      ...original,
+      lineId,
+      productId: product.id,
+      productName: String(submitted.productName ?? submitted.name ?? original.productName).trim(),
+      ...(submitted.brandName != null ? { brandName: String(submitted.brandName).trim() } : {}),
+      code: String(submitted.code ?? submitted.articleNumber ?? original.code).trim(),
+      size: String(submitted.size ?? original.size ?? '').trim(),
+      season: String(submitted.season ?? original.season ?? '').trim(),
+      rackLocation: String(submitted.rackLocation ?? submitted.location ?? original.rackLocation ?? '').trim(),
+      quantity: positiveQuantity(submitted.quantity),
+      unitCost: amountOf(submitted.unitCost ?? submitted.cost ?? original.unitCost),
+      salePrice: amountOf(submitted.salePrice ?? original.salePrice),
+      ...(original.productType === 'tan' ? {
+        productType: 'tan',
+        tanType: String(submitted.tanType ?? original.tanType ?? '').trim(),
+        tanName: String(submitted.tanName ?? submitted.productName ?? original.tanName ?? '').trim(),
+        metersPerTan: Number(submitted.metersPerTan ?? original.metersPerTan),
+        buyPricePerMeter: Number(submitted.unitCost ?? submitted.cost ?? original.unitCost) / Number(submitted.metersPerTan ?? original.metersPerTan),
+        salePricePerMeter: Number(submitted.salePrice ?? original.salePrice) / Number(submitted.metersPerTan ?? original.metersPerTan),
+      } : {}),
+      batchNumber: original.batchNumber || purchase.batchNumber,
+    }
+  })
+  for (const item of items) if (item.productType === 'tan') {
+    if (!item.tanType || !(item.metersPerTan > 0)) throw new Error('Tan type and a positive length are required.')
+    item.productName = item.tanName
+  }
+  const date = dateOf(input.date ?? input.arrivalDate ?? purchase.date)
+  const total = items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
+  const cash = amountOf(input.payments?.cash ?? purchase.payments?.cash ?? 0)
+  const bank = amountOf(input.payments?.bank ?? input.payments?.bankTransfer ?? purchase.payments?.bank ?? 0)
+  const cheque = amountOf(input.payments?.cheque ?? purchase.payments?.cheque ?? 0)
+  if (cash + bank + cheque > total + 0.005) throw new Error('Combined payments cannot exceed the purchase total.')
+  const bankDetails = bank > 0 ? {
+    bankName: String(input.bankDetails?.bankName ?? purchase.bankDetails?.bankName ?? '').trim(),
+    accountNumber: String(input.bankDetails?.accountNumber ?? purchase.bankDetails?.accountNumber ?? '').trim(),
+    amount: bank,
+  } : null
+  if (bank > 0 && !bankDetails.bankName) throw new Error('Select a bank/account or enter a bank name for the bank payment.')
+  const submittedCheques = Array.isArray(input.cheques) ? input.cheques.map((entry) => ({
+    number: String(entry.number || '').trim(),
+    bank: String(entry.bank || '').trim(),
+    amount: amountOf(entry.amount),
+    issued: dateOf(entry.issued ?? date),
+    expectedClearanceDate: entry.expectedClearanceDate || '',
+  })) : purchase.cheques || []
+  const chequeEntries = cheque > 0 ? submittedCheques : []
+  if (cheque > 0 && !chequeEntries.length) throw new Error('Add at least one cheque for the cheque payment.')
+  if (chequeEntries.some((entry) => !entry.number || !entry.bank || !entry.amount)) throw new Error('Each cheque needs a number, bank and positive amount.')
+  if (Math.abs(chequeEntries.reduce((sum, entry) => sum + entry.amount, 0) - cheque) > 0.005) throw new Error('Cheque entries must add up to the cheque payment amount.')
+
+  const activeCheques = database.cheques.filter((entry) => entry.sourceType === 'purchase' && entry.referenceId === purchase.id && entry.status !== 'Cancelled')
+  const chequeChanged = cheque !== Number(purchase.payments?.cheque || 0)
+    || JSON.stringify(chequeEntries) !== JSON.stringify((purchase.cheques || []).map(({ number, bank, amount, issued, expectedClearanceDate }) => ({ number, bank, amount, issued, expectedClearanceDate })))
+  if (chequeChanged && activeCheques.some((entry) => entry.status !== 'Pending')) throw new Error('A cleared or resolved supplier cheque cannot be changed while editing a delivery.')
+
+  const oldDue = Number(purchase.due || 0)
+  const due = Math.max(0, total - cash - bank - cheque)
+  const updatedPurchase = {
+    ...purchase,
+    padNumber: input.padNumber == null ? purchase.padNumber || '' : String(input.padNumber).trim(),
+    date,
+    items,
+    total,
+    payments: { cash, bank, cheque },
+    bankDetails,
+    cheques: chequeEntries,
+    paid: cash + bank + cheque,
+    due,
+  }
+  let products = [...database.products]
+  const removedItems = purchase.items.filter((item, index) => !seenLineIds.has(item.lineId || `legacy-line-${index}`))
+  for (const original of removedItems) {
+    const product = products.find((entry) => entry.id === original.productId) || products.find((entry) =>
+      entry.supplierId === purchase.supplierId
+      && String(entry.batchNumber || '').toLowerCase() === String(original.batchNumber || purchase.batchNumber || '').toLowerCase()
+      && (original.code && entry.code === original.code || original.productName && entry.name === original.productName))
+    if (!product) throw new Error('A removed stock product could not be found.')
+    const otherPurchase = database.purchases.some((entry) => entry.id !== purchase.id && (entry.items || []).some((item) => item.productId === product.id)) || items.some((item) => item.productId === product.id)
+    const otherActivity = (database.stockMovements || []).some((entry) => entry.productId === product.id && !(entry.type === 'purchase' && entry.referenceId === purchase.id))
+      || (database.sales || []).some((entry) => (entry.items || []).some((item) => item.productId === product.id))
+      || (database.claims || []).some((entry) => entry.productId === product.id)
+      || (database.stockAudits || []).some((entry) => (entry.items || []).some((item) => item.productId === product.id))
+    const quantity = Number(original.quantity || 0)
+    const remaining = Number(product.stockQuantity || 0) - quantity
+    if (remaining < Number(product.reservedQuantity || 0)) throw new Error(`Cannot remove ${product.name}: some of this stock has been sold, used or reserved.`)
+    const hasOtherStock = remaining > 0 || Number(product.defectiveQuantity || 0) > 0
+    if (!otherPurchase && !otherActivity && !hasOtherStock) {
+      products = products.filter((entry) => entry.id !== product.id)
+    } else {
+      const remainingValue = Number(product.stockQuantity || 0) * Number(product.averageCost || 0) - quantity * Number(original.unitCost || 0)
+      products = products.map((entry) => entry.id === product.id ? { ...entry, stockQuantity: remaining, averageCost: remaining > 0 ? Math.max(0, remainingValue / remaining) : Number(entry.averageCost || 0) } : entry)
+    }
+  }
+  for (const item of items) {
+    const original = originalByLine.get(item.lineId)
+    const deltaQuantity = item.quantity - Number(original.quantity || 0)
+    const product = products.find((entry) => entry.id === item.productId)
+    const stockQuantity = Number(product.stockQuantity || 0) + deltaQuantity
+    if (stockQuantity < Number(product.reservedQuantity || 0)) throw new Error(`Cannot reduce ${product.name} below its reserved or already-used stock.`)
+    const costDelta = item.quantity * item.unitCost - Number(original.quantity || 0) * Number(original.unitCost || 0)
+    const averageCost = stockQuantity > 0
+      ? Math.max(0, (Number(product.stockQuantity || 0) * Number(product.averageCost || 0) + costDelta) / stockQuantity)
+      : item.unitCost
+    products = products.map((entry) => entry.id === product.id ? {
+      ...entry,
+      name: item.productName || entry.name,
+      code: item.code || entry.code,
+      size: item.size || '',
+      season: item.season || '',
+      rackLocation: item.rackLocation || '',
+      salePrice: item.salePrice,
+      ...(item.productType === 'tan' ? { productType: 'tan', tanType: item.tanType, metersPerTan: item.metersPerTan, buyPricePerMeter: item.buyPricePerMeter, salePricePerMeter: item.salePricePerMeter } : {}),
+      stockQuantity,
+      averageCost,
+      arrivalDate: date,
+    } : entry)
+  }
+  const suppliers = updateBalance(database.suppliers, purchase.supplierId, due - oldDue)
+  let stockMovements = database.stockMovements.filter((entry) => entry.type !== 'purchase' || entry.referenceId !== purchase.id)
+  for (const item of items) stockMovements = addMovement({ ...database, stockMovements }, {
+    productId: item.productId,
+    type: 'purchase',
+    quantity: item.quantity,
+    referenceId: purchase.id,
+    date,
+    note: item.batchNumber || purchase.batchNumber || purchase.id,
+  })
+
+  let payments = database.payments.filter((entry) => !(entry.type === 'supplier-payment' && entry.referenceId === purchase.id))
+  for (const [method, amount] of [['cash', cash], ['bank', bank], ['cheque', cheque]]) {
+    if (amount > 0) payments = addPayment({ ...database, payments }, {
+      type: 'supplier-payment',
+      method,
+      amount,
+      ...(method === 'bank' ? { bankDetails } : {}),
+      supplierId: purchase.supplierId,
+      referenceId: purchase.id,
+      date,
+    })
+  }
+  let cheques = database.cheques
+  if (chequeChanged) {
+    cheques = cheques.filter((entry) => !(entry.sourceType === 'purchase' && entry.referenceId === purchase.id && entry.status === 'Pending'))
+    if (cheque > 0) cheques = [
+      ...chequeEntries.map((entry) => record('cheque', {
+        direction: 'given',
+        partyType: 'supplier',
+        partyId: purchase.supplierId,
+        party: purchase.supplier,
+        ...entry,
+        referenceId: purchase.id,
+        sourceType: 'purchase',
+        appliedToBalance: true,
+        status: 'Pending',
+      })),
+      ...cheques,
+    ]
+  } else if (cheque > 0) {
+    cheques = cheques.map((entry) => entry.sourceType === 'purchase' && entry.referenceId === purchase.id && entry.status === 'Pending'
+      ? { ...entry, issued: entry.issued || date }
+      : entry)
+  }
+  const next = {
+    ...database,
+    products,
+    suppliers,
+    purchases: database.purchases.map((entry) => entry.id === purchase.id ? updatedPurchase : entry),
+    payments,
+    cheques,
+    stockMovements,
+    auditHistory: addAudit(database, 'purchase-edit', purchase.id, `Receive stock ${purchase.batchNumber || purchase.id} updated`),
+  }
+  return { database: next, record: updatedPurchase }
+}
+
+function appendPurchaseItems(database, purchase, input) {
+  if (input.supplierId && input.supplierId !== purchase.supplierId) throw new Error('A received purchase cannot be moved to another supplier.')
+  if (database.supplierReturns.some((entry) => entry.purchaseId === purchase.id)) throw new Error('This delivery has supplier returns and cannot be edited safely.')
+  if (!Array.isArray(input.appendItems) || input.appendItems.length === 0) throw new Error('Add at least one new stock item before saving.')
+  const idempotencyKey = String(input.appendIdempotencyKey || '').trim()
+  if (!idempotencyKey) throw new Error('A delivery-item submission key is required.')
+  const fingerprint = JSON.stringify(input.appendItems.map((item) => ({
+    existingProductId: item.existingProductId || null,
+    productName: item.productName ?? item.name ?? '',
+    code: item.code ?? item.articleNumber ?? '',
+    padNumber: item.padNumber ?? '',
+    quantity: item.quantity,
+    unitCost: item.unitCost ?? item.cost ?? 0,
+    salePrice: item.salePrice ?? 0,
+    season: item.season || '',
+  })))
+  const previousOperation = (purchase.appendOperations || []).find((entry) => entry.idempotencyKey === idempotencyKey)
+  if (previousOperation) {
+    if (previousOperation.fingerprint !== fingerprint) throw new Error('This add-stock submission key was already used for different item details.')
+    return { database, record: purchase }
+  }
+  const supplier = database.suppliers.find((entry) => entry.id === purchase.supplierId)
+  if (!supplier) throw new Error('The delivery supplier could not be found.')
+  const date = purchase.date || dateOf(input.date)
+  const { batchNumber, supplierBillNumber } = nextReceivingBatch(database, supplier, date)
+  const items = input.appendItems.map((submitted) => {
+    const productName = String(submitted.productName ?? submitted.name ?? submitted.articleNumber ?? submitted.code ?? '').trim()
+    const code = String(submitted.code ?? submitted.articleNumber ?? '').trim()
+    if (!productName && !submitted.existingProductId) throw new Error('Each added stock item needs an article/design number or an existing product.')
+    return {
+      lineId: makeId('purchase-line'),
+      productId: null,
+      existingProductId: submitted.existingProductId || null,
+      productName,
+      ...(submitted.brandName != null ? { brandName: String(submitted.brandName).trim() } : {}),
+      code,
+      padNumber: String(submitted.padNumber ?? purchase.padNumber ?? '').trim(),
+      batchNumber,
+      size: String(submitted.size ?? '').trim(),
+      season: String(submitted.season ?? '').trim(),
+      rackLocation: String(submitted.rackLocation ?? submitted.location ?? '').trim(),
+      quantity: positiveQuantity(submitted.quantity),
+      unitCost: amountOf(submitted.unitCost ?? submitted.cost ?? 0),
+      salePrice: amountOf(submitted.salePrice ?? 0),
+    }
+  })
+  let products = [...database.products]
+  let stockMovements = [...database.stockMovements]
+  for (const item of items) {
+    let product = null
+    if (item.existingProductId) {
+      product = products.find((entry) => entry.id === item.existingProductId)
+      if (!product) throw new Error('The selected existing stock product could not be found.')
+      if (product.supplierId && product.supplierId !== supplier.id) throw new Error('Choose an existing product belonging to the delivery supplier.')
+      const previousQuantity = Number(product.stockQuantity || 0)
+      const nextQuantity = previousQuantity + item.quantity
+      item.productId = product.id
+      item.productName ||= product.name
+      item.code ||= product.code
+      products = products.map((entry) => entry.id === product.id ? {
+        ...entry,
+        stockQuantity: nextQuantity,
+        averageCost: ((previousQuantity * Number(entry.averageCost || 0)) + (item.quantity * item.unitCost)) / (nextQuantity || 1),
+        salePrice: item.salePrice || Number(entry.salePrice || 0),
+        season: item.season || entry.season || '',
+        ...(!entry.supplierId ? { supplierId: supplier.id } : {}),
+      } : entry)
+    } else {
+      product = record('product', {
+        name: item.productName,
+        code: item.code || makeId('sku'),
+        categoryId: null,
+        size: item.size,
+        season: item.season,
+        stockQuantity: item.quantity,
+        reservedQuantity: 0,
+        defectiveQuantity: 0,
+        averageCost: item.unitCost,
+        salePrice: item.salePrice,
+        supplierId: supplier.id,
+        batchNumber,
+        rackLocation: item.rackLocation,
+        active: true,
+        purchaseId: purchase.id,
+        arrivalDate: date,
+      })
+      item.productId = product.id
+      products.push(product)
+    }
+    stockMovements = addMovement({ ...database, stockMovements }, {
+      productId: item.productId,
+      type: 'purchase',
+      quantity: item.quantity,
+      referenceId: purchase.id,
+      date,
+      note: item.batchNumber,
+    })
+  }
+  const appendedCost = items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0)
+  const total = Number(purchase.total || 0) + appendedCost
+  const payments = purchase.payments || { cash: 0, bank: 0, cheque: 0 }
+  const paid = Number(purchase.paid ?? (Number(payments.cash || 0) + Number(payments.bank || payments.bankTransfer || 0) + Number(payments.cheque || 0)))
+  const due = Math.max(0, total - paid)
+  const updatedPurchase = {
+    ...purchase,
+    items: [...purchase.items, ...items],
+    total,
+    paid,
+    due,
+    appendOperations: [...(purchase.appendOperations || []), { idempotencyKey, fingerprint, batchNumber, itemIds: items.map((item) => item.lineId), createdAt: now() }],
+  }
+  const suppliers = updateBalance(database.suppliers, supplier.id, due - Number(purchase.due || 0))
+  const next = {
+    ...database,
+    products,
+    suppliers,
+    purchases: database.purchases.map((entry) => entry.id === purchase.id ? updatedPurchase : entry),
+    stockMovements,
+    counters: {
+      ...database.counters,
+      supplierReceivings: {
+        ...database.counters?.supplierReceivings,
+        [supplier.id]: Math.max(Number(database.counters?.supplierReceivings?.[supplier.id] || 0), supplierBillNumber),
+      },
+    },
+    auditHistory: addAudit(database, 'purchase-stock-addition', purchase.id, `Stock added to delivery ${batchNumber}`),
+  }
+  return { database: next, record: updatedPurchase }
 }
 
 export function createAccount(database, accountType, input) {
@@ -367,6 +820,15 @@ export function createProduct(database, input) {
   const product = record('product', { ...input, name, code: code || makeId('sku'), batchNumber: String(input.batchNumber || '').trim(), size: String(input.size || '').trim(), stockQuantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: amountOf(input.averageCost ?? 0), salePrice: amountOf(input.salePrice ?? 0), active: true })
   const next = { ...database, products: [product, ...database.products], auditHistory: addAudit(database, 'product', product.id, `Product ${product.name} created`) }
   return { database: next, record: product }
+}
+
+export function createTanType(database, input) {
+  const name = String(input.name || '').trim()
+  if (!name) throw new Error('Tan type is required.')
+  const existing = database.tanTypes || []
+  if (existing.some((entry) => entry.name.toLowerCase() === name.toLowerCase())) throw new Error('This Tan type already exists.')
+  const tanType = record('tan-type', { name, active: true })
+  return { database: { ...database, tanTypes: [tanType, ...existing] }, record: tanType }
 }
 
 export function adjustStock(database, input) {
@@ -432,9 +894,20 @@ export function recordStockCountAudit(database, input) {
   return { database: next, record: audit }
 }
 
+export function assertDueCustomerChequesUpdated(database, date) {
+  const finalStatuses = new Set(['Cleared', 'Returned', 'Cancelled', 'Bounced', 'Bounced / Dishonoured', 'Replaced'])
+  const due = (database.cheques || []).filter(cheque => cheque.direction === 'received'
+    && cheque.partyType !== 'supplier'
+    && String(cheque.expectedClearanceDate || cheque.dueDate || '').slice(0, 10) === date
+    && !finalStatuses.has(cheque.status))
+  if (due.length) throw new Error('Update the status of customer cheques due on ' + date + ' before daily closing: ' + due.map(cheque => cheque.number || cheque.id).join(', ') + '. Mark cleared, returned/bounced, cancelled, replaced, or reschedule to the correct future date.')
+}
+
 export function saveDailyRecord(database, input, actor = null) {
   const date = dateOf(input.date)
-  const type = input.type === 'opening' ? 'opening' : 'closing'
+  if (!['opening', 'closing'].includes(input.type)) throw new Error('Daily record type must be opening or closing.')
+  const type = input.type
+  if (type === 'closing') assertDueCustomerChequesUpdated(database, date)
   const branchId = normalizeBranchId(input.branchId)
   if (type === 'closing' && !database.dailyClosings.some((entry) => entry.date === date && entry.type === 'opening' && recordMatchesBranch(entry, branchId))) {
     throw new Error('Save the daily opening before recording the daily closing.')
@@ -538,7 +1011,7 @@ export function updateClaimStatus(database, claimId, status, resolution = '') {
   const suppliers = (status === 'Approved' || status === 'Replacement') && claim.supplierId ? updateBalance(database.suppliers, claim.supplierId, -Number(claim.amount || 0)) : database.suppliers
   let products = database.products
   let stockMovements = database.stockMovements
-  if ((status === 'Approved' || status === 'Replacement') && claim.productId) {
+  if ((status === 'Approved' || status === 'Replacement') && claim.productId && !claim.inventoryManagedBySource) {
     products = products.map((product) => product.id === claim.productId ? {
       ...product,
       defectiveQuantity: Math.max(0, Number(product.defectiveQuantity || 0) - claim.quantity),
@@ -555,10 +1028,13 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
   const businessDate = context.businessDate || businessDateString()
   switch (command) {
     case 'create-sale': {
+      if (input.idempotencyKey && database.sales.some((sale) => sale.idempotencyKey === String(input.idempotencyKey).trim())) return createSale(database, input)
       assertSaleDayOpen(database, { date: businessDate, branchId })
-      return createSale(database, { ...input, date: businessDate, branchId })
+      return createSale(database, { ...input, date: businessDate, branchId }, { actor: context.actor })
     }
     case 'receive-purchase': return receivePurchase(database, input)
+    case 'create-tan-type': return createTanType(database, input)
+    case 'update-purchase': return updatePurchase(database, input)
     case 'customer-return': return processCustomerReturn(database, input)
     case 'supplier-return': return processSupplierReturn(database, input)
     case 'account-payment': return recordAccountPayment(database, input)
@@ -570,6 +1046,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'discard-held-order': return releaseHeldOrder(database, input.heldId, 'discarded')
     case 'create-customer': return createAccount(database, 'customer', input)
     case 'create-supplier': return createAccount(database, 'supplier', input)
+    case 'delete-supplier': return deleteSupplier(database, input.supplierId)
     case 'create-product': return createProduct(database, input)
     case 'adjust-stock': return adjustStock(database, input)
     case 'stock-audit': return recordStockCountAudit(database, input)
@@ -615,9 +1092,12 @@ export function processCustomerReturn(database, input) {
   const alreadyReturned = database.returns.filter((entry) => entry.saleId === sale.id && (entry.lineId || entry.productId) === returnKey).reduce((sum, entry) => sum + entry.quantity, 0)
   const soldQuantity = originalItem.lineId ? originalItem.quantity : sale.items.filter((item) => item.productId === originalItem.productId).reduce((sum, item) => sum + item.quantity, 0)
   if (alreadyReturned + quantity > soldQuantity) throw new Error('Return quantity exceeds the amount sold and not yet returned.')
-  const amount = quantity * originalItem.unitPrice
+  if (input.refundType && !['cash', 'khata'].includes(input.refundType)) throw new Error('Refund type must be cash or khata.')
+  if (input.condition && !['sellable', 'Sellable stock', 'damaged', 'defective', 'Damaged / Defective'].includes(input.condition)) throw new Error('Choose a valid return condition.')
+  if (originalItem.isReturn) throw new Error('A return line cannot itself be returned.')
+  const amount = returnRefundAmount(sale, originalItem, quantity, alreadyReturned)
   const condition = input.condition || 'sellable'
-  const result = record('return', { saleId: sale.id, saleNumber: sale.number, customerId: sale.customerId, productId: originalItem.productId, lineId: originalItem.lineId, code: originalItem.code, itemName: originalItem.name, quantity, unitPrice: originalItem.unitPrice, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), amount, condition, refundType: input.refundType || 'khata', date: dateOf(input.date) })
+  const result = record('return', { saleId: sale.id, saleNumber: sale.number, customerId: sale.customerId, productId: originalItem.productId, lineId: originalItem.lineId, code: originalItem.code, itemName: originalItem.name, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || '', metersPerTan: originalItem.metersPerTan, quantity, unitPrice: originalItem.unitPrice, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), amount, condition, refundType: input.refundType || 'khata', date: dateOf(input.date) })
   let products = database.products
   let stockMovements = database.stockMovements
   if (condition === 'sellable' || condition === 'Sellable stock') {
@@ -646,7 +1126,7 @@ export function processSupplierReturn(database, input) {
   if (alreadyReturned + quantity > receivedQuantity) throw new Error('Return quantity exceeds the amount received and not yet returned.')
   const product = database.products.find((entry) => entry.id === originalItem.productId)
   if (!product || Number(product.stockQuantity || 0) - Number(product.reservedQuantity || 0) < quantity) throw new Error('There is not enough unreserved stock to return this item.')
-  const result = record('supplier-return', { purchaseId: purchase.id, purchaseItemId: originalItem.lineId, supplierId: purchase.supplierId, productId: product.id, code: originalItem.code, itemName: originalItem.productName, quantity, amount: quantity * originalItem.unitCost, date: dateOf(input.date), reason: input.reason || '' })
+  const result = record('supplier-return', { purchaseId: purchase.id, purchaseItemId: originalItem.lineId, supplierId: purchase.supplierId, productId: product.id, code: originalItem.code, itemName: originalItem.productName, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || purchase.batchNumber || '', metersPerTan: originalItem.metersPerTan, buyPricePerMeter: originalItem.buyPricePerMeter, salePricePerMeter: originalItem.salePricePerMeter, quantity, amount: quantity * originalItem.unitCost, date: dateOf(input.date), reason: input.reason || '' })
   const products = database.products.map((entry) => entry.id === product.id ? { ...entry, stockQuantity: Number(entry.stockQuantity) - quantity } : entry)
   const suppliers = updateBalance(database.suppliers, purchase.supplierId, -result.amount)
   result.batchNumber = receivingLabel(purchase)
@@ -677,6 +1157,7 @@ export function recordExpense(database, input) {
   const amount = amountOf(input.amount)
   if (amount <= 0) throw new Error('Expense amount must be greater than zero.')
   const method = input.method || 'cash'
+  if (!['cash', 'bank', 'cheque'].includes(method)) throw new Error('Expense method must be cash, bank, or cheque.')
   const expense = record('expense', { category: input.category || 'Other', amount, date: dateOf(input.date), description: input.description || '', paidTo: input.paidTo || '', method, account: input.account || method })
   const next = { ...database, expenses: [expense, ...database.expenses], auditHistory: addAudit(database, 'expense', expense.id, `${expense.category} expense recorded`) }
   return { database: next, record: expense }
@@ -687,6 +1168,7 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
   if (!allowedStatuses.includes(status)) throw new Error('Choose a valid cheque transaction status.')
   const cheque = database.cheques.find((entry) => entry.id === chequeId)
   if (!cheque) throw new Error('Cheque could not be found.')
+  if (options.bankCharges != null) amountOf(options.bankCharges)
   if (cheque.status === status) return { database, record: cheque }
   const previousStatus = cheque.status || 'Pending'
   const pendingStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled']
@@ -712,7 +1194,7 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
     ...(bounced ? {
       bounceDate: options.bounceDate || dateOf(),
       bounceReason: String(options.bounceReason || options.remarks || '').trim(),
-      bankCharges: Number(options.bankCharges || 0),
+      bankCharges: amountOf(options.bankCharges || 0),
     } : {}),
   }
   let next = { ...database, cheques: database.cheques.map((entry) => entry.id === chequeId ? updated : entry) }
@@ -734,7 +1216,9 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
 export function updateChequeDetails(database, input, actor = null) {
   const cheque = database.cheques.find((entry) => entry.id === input.chequeId)
   if (!cheque) throw new Error('Cheque could not be found.')
-  const dueDate = String(input.expectedClearanceDate ?? cheque.expectedClearanceDate ?? '').slice(0, 10)
+  const dueDate = String(input.expectedClearanceDate ?? cheque.expectedClearanceDate ?? '')
+  if (dueDate) requireDate(dueDate)
+  if (!dueDate && (cheque.expectedClearanceDate || cheque.dueDate)) throw new Error('A cheque due date cannot be removed. Reschedule to a valid date.')
   if (dueDate && Number.isNaN(Date.parse(`${dueDate}T00:00:00Z`))) throw new Error('Enter a valid expected clearance date.')
   const oldDate = cheque.expectedClearanceDate || ''
   const changedDate = dueDate !== oldDate
@@ -828,7 +1312,7 @@ export function calculateDailyClosing(database, date) {
   const bankTransactions = (database.bankTransactions || []).filter((entry) => sameDate(entry))
   const cashWithdrawals = bankTransactions.filter((entry) => entry.type === 'withdrawal' && entry.destination === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const cashDeposits = bankTransactions.filter((entry) => entry.type === 'deposit' && entry.source === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
-  const expectedCash = money(opening + cashSales + customerPayments + cashOtherReceipts + cashWithdrawals - supplierPayments - cashExpenses - cashRefunds - cashDeposits)
+  const expectedCash = money(opening + cashSales + customerPayments + cashOtherReceipts + cashWithdrawals - cashExpenses - cashRefunds - cashDeposits)
   return { date, opening, cashSales, bankSales, chequeSales, creditSales, customerPayments, cashOtherReceipts, supplierPayments, expenseTotal, cashExpenses, bankExpenses, chequeExpenses, cashRefunds, cashWithdrawals, cashDeposits, expectedCash }
 }
 
@@ -961,6 +1445,19 @@ export function saveBankBalances(database, input, actor = null) {
   return { database: next, record: records.filter((entry) => entry.date === date && entry.createdAt === createdAt) }
 }
 
+export function financialPeriodDatabase(database, from = '', to = '') {
+  const inRange = (value) => { const date = String(value || '').slice(0, 10); return (!from || date >= from) && (!to || date <= to) }
+  const byId = new Map(database.sales.map(sale => [sale.id, sale]))
+  return { ...database,
+    sales: database.sales.filter(sale => inRange(sale.date)).map(sale => ({ ...sale, total: Number(sale.total ?? sale.totalAmount ?? 0) + Number(sale.returnTotal || 0), returnTotal: 0, items: (sale.items || []).filter(item => !item.isReturn) })),
+    returns: database.returns.filter(entry => inRange(byId.get(entry.saleId)?.date || entry.saleDate || entry.date)).map(entry => {
+      const item = byId.get(entry.saleId)?.items?.find(item => entry.lineId ? item.lineId === entry.lineId : item.productId === entry.productId)
+      return { ...entry, refundType: entry.refundType === 'sale-adjustment' ? 'financial-adjustment' : entry.refundType, unitCostAtSale: entry.unitCostAtSale ?? item?.unitCostAtSale ?? item?.costPrice ?? 0 }
+    }),
+    expenses: database.expenses.filter(entry => inRange(entry.date)),
+  }
+}
+
 export function calculateBusinessTotals(database) {
   const getGrossBilled = (sale) => Number(sale.subtotal ?? (sale.items || []).filter((item) => !item.isReturn).reduce((sum, item) => sum + Number(item.lineTotal ?? Number(item.quantity || 0) * Number(item.unitPrice ?? item.price ?? 0)), 0))
   const getDiscount = (sale) => Number(sale.discount || 0)
@@ -1049,6 +1546,7 @@ export function validateBackup(data) {
       database[key] = data[key]
     }
   }
+  validateBackupNumbers(database)
   if (currentFormat) validateRelationships(database)
   return database
 }
@@ -1065,14 +1563,15 @@ function validateRelationships(database) {
     assertReference('suppliers', purchase.supplierId, 'purchase/supplier relationship')
     for (const item of purchase.items || []) {
       assertReference('products', item.productId, 'purchase item/product relationship')
-      if (purchase.batchNumber && item.batchNumber !== purchase.batchNumber) throw new Error('Receiving items must belong to their bill Batch Number.')
+      if (purchase.batchNumber && !item.batchNumber) throw new Error('Receiving items must retain their assigned Batch Number.')
     }
   }
   for (const product of database.products) {
     if (!product.purchaseId) continue
     assertReference('purchases', product.purchaseId, 'stock/receiving relationship')
     const purchase = database.purchases.find((entry) => entry.id === product.purchaseId)
-    if (purchase.batchNumber && product.batchNumber !== purchase.batchNumber) throw new Error('Received stock must retain its bill Batch Number.')
+    const linkedItemBatch = (purchase.items || []).some((item) => item.productId === product.id && item.batchNumber === product.batchNumber)
+    if (purchase.batchNumber && product.batchNumber !== purchase.batchNumber && !linkedItemBatch) throw new Error('Received stock must retain its bill or item Batch Number.')
   }
   for (const entry of database.returns) {
     assertReference('sales', entry.saleId, 'customer return/sale relationship')
@@ -1109,6 +1608,12 @@ function validateRelationships(database) {
 export function createManualCheque(database, input, actor = null) {
   const amount = amountOf(input.amount)
   if (!amount) throw new Error('Cheque amount must be greater than zero.')
+  if (input.direction && !['given', 'received'].includes(input.direction)) throw new Error('Cheque direction must be received or given.')
+  if (input.partyType && !['customer', 'supplier'].includes(input.partyType)) throw new Error('Cheque party must be customer or supplier.')
+  if (!String(input.number || '').trim()) throw new Error('Cheque number is required.')
+  if (!String(input.bank || '').trim()) throw new Error('Cheque bank is required.')
+  if (input.dueDate) requireDate(input.dueDate)
+  if (input.expectedClearanceDate) requireDate(input.expectedClearanceDate)
   const direction = input.direction === 'given' ? 'given' : 'received'
   const partyType = input.partyType || (direction === 'given' ? 'supplier' : 'customer')
   const collection = partyType === 'supplier' ? 'suppliers' : 'customers'
@@ -1272,7 +1777,9 @@ export function createInstallmentPlan(database, input) {
   const customer = database.customers.find((entry) => entry.id === input.customerId)
   if (!customer) throw new Error('The customer account could not be found.')
   const totalAmount = amountOf(input.totalAmount)
+  if (totalAmount <= 0) throw new Error('Installment total must be greater than zero.')
   const installmentCount = positiveQuantity(input.installmentCount)
+  if (installmentCount > 1200) throw new Error('Installment count cannot exceed 1200.')
   const amountEach = Math.round((totalAmount / installmentCount) * 100) / 100
   const startDate = dateOf(input.startDate || input.date)
   const schedule = Array.from({ length: installmentCount }, (_, index) => {
@@ -1298,8 +1805,11 @@ export function createInstallmentPlan(database, input) {
 export function receiveInstallmentPayment(database, input) {
   const plan = (database.installments || []).find((entry) => entry.id === input.installmentId)
   if (!plan) throw new Error('Installment plan could not be found.')
+  if (plan.status === 'completed') throw new Error('This installment plan is already completed.')
+  if (input.method && !['cash', 'bank'].includes(input.method)) throw new Error('Installments require a settled cash or bank payment.')
   const amount = amountOf(input.amount)
   if (!amount) throw new Error('Installment amount must be greater than zero.')
+  if (amount > Number(plan.totalAmount) - Number(plan.paidAmount || 0) + 0.005) throw new Error('Installment payment exceeds the remaining balance.')
   let remaining = amount
   const schedule = plan.schedule.map((row) => {
     if (!remaining || row.status === 'paid') return row
@@ -1327,6 +1837,7 @@ export function receiveInstallmentPayment(database, input) {
 export function updateProductDetails(database, input) {
   const product = database.products.find((entry) => entry.id === input.productId)
   if (!product) throw new Error('Product could not be found.')
+  if (input.name != null && !String(input.name).trim()) throw new Error('Product name is required.')
   const updated = {
     ...product,
     name: input.name == null ? product.name : String(input.name).trim(),
@@ -1350,8 +1861,13 @@ export function updateAccountDetails(database, input) {
   if (!account) throw new Error(`The ${input.accountType || 'customer'} account could not be found.`)
   const supplierCode = input.accountType === 'supplier' && input.supplierCode != null ? String(input.supplierCode).trim().toUpperCase() : account.supplierCode
   if (input.accountType === 'supplier' && supplierCode && database.suppliers.some((entry) => entry.id !== account.id && String(entry.supplierCode || '').trim().toUpperCase() === supplierCode)) throw new Error('A supplier with this code already exists.')
+  if (input.name != null && !String(input.name).trim()) throw new Error('Account name is required.')
+  const balance = input.accountType === 'supplier' && input.balance != null ? Number(input.balance) : Number(account.balance ?? account.openingBalance ?? 0)
+  if (!Number.isFinite(balance)) throw new Error('Balance must be a valid amount.')
+  const previousBalance = Number(account.balance ?? account.openingBalance ?? 0)
   const updated = {
     ...account,
+    ...(input.accountType === 'supplier' && input.balance != null ? { balance, openingBalance: Number(account.openingBalance || 0) + balance - previousBalance } : {}),
     name: input.name == null ? account.name : String(input.name).trim(),
     ...(input.accountType === 'supplier' ? { supplierCode } : {}),
     phone: input.phone == null ? account.phone : String(input.phone).trim(),
@@ -1362,6 +1878,20 @@ export function updateAccountDetails(database, input) {
   }
   const next = { ...database, [key]: database[key].map((entry) => entry.id === account.id ? updated : entry), auditHistory: addAudit(database, `${input.accountType || 'customer'}-update`, account.id, `${updated.name} details updated`) }
   return { database: next, record: updated }
+}
+
+export function deleteSupplier(database, supplierId) {
+  const supplier = database.suppliers.find((entry) => entry.id === supplierId)
+  if (!supplier) throw new Error('Supplier could not be found.')
+  if (Number(supplier.balance || 0) !== 0) throw new Error('Settle the supplier balance before deleting this supplier.')
+  const linked = (database.purchases || []).some((entry) => entry.supplierId === supplierId)
+    || (database.products || []).some((entry) => entry.supplierId === supplierId)
+    || (database.payments || []).some((entry) => entry.supplierId === supplierId)
+    || (database.supplierReturns || []).some((entry) => entry.supplierId === supplierId)
+    || (database.claims || []).some((entry) => entry.supplierId === supplierId)
+    || (database.cheques || []).some((entry) => entry.supplierId === supplierId || (entry.partyType === 'supplier' && entry.partyId === supplierId))
+  if (linked) throw new Error('This supplier has linked transactions or stock and cannot be deleted.')
+  return { database: { ...database, suppliers: database.suppliers.filter((entry) => entry.id !== supplierId), auditHistory: addAudit(database, 'supplier-delete', supplierId, `Supplier ${supplier.name} deleted`) }, record: { id: supplierId, deleted: true } }
 }
 
 export function updateSaleReceiptDetails(database, input) {
@@ -1403,7 +1933,8 @@ export function updateSaleBill(database, input) {
       const original = itemByLine.get(lineId)
       if (!original || retainedLineIds.has(lineId)) throw new Error('Bill items must use unique saved item lines.')
       retainedLineIds.add(lineId)
-      return { ...original, quantity, price, unitPrice: price, lineTotal: quantity * price }
+      const tan = original.productType === 'tan'
+      return { ...original, quantity, price, unitPrice: price, lineTotal: quantity * (tan ? Number(original.metersPerTan) : 1) * price }
     }
     const product = getProduct(database.products, { productId: submitted.productId })
     return {
@@ -1411,11 +1942,15 @@ export function updateSaleBill(database, input) {
       productId: product.id,
       code: product.code ?? '',
       name: product.name,
+      productType: product.productType === 'tan' ? 'tan' : 'suit',
+      tanType: product.tanType || '',
+      batchNumber: product.batchNumber || '',
+      metersPerTan: product.productType === 'tan' ? Number(product.metersPerTan) : undefined,
       quantity,
       price,
       unitPrice: price,
       unitCostAtSale: Number(product.averageCost || 0),
-      lineTotal: quantity * price,
+      lineTotal: quantity * (product.productType === 'tan' ? Number(product.metersPerTan) : 1) * price,
     }
   })
   const subtotal = items.reduce((sum, item) => sum + item.lineTotal, 0)
@@ -1601,7 +2136,7 @@ export function calculateReports(database, { from, to, period } = {}) {
   const purchases = filterByDateRange(database.purchases, bounds.from, bounds.to)
   const expenses = filterByDateRange(database.expenses, bounds.from, bounds.to)
   const payments = filterByDateRange(database.payments, bounds.from, bounds.to)
-  const subset = { ...database, sales, purchases, expenses, payments, returns: filterByDateRange(database.returns, bounds.from, bounds.to) }
+  const subset = { ...financialPeriodDatabase(database, bounds.from, bounds.to), purchases, expenses, payments }
   return {
     period: period || 'custom',
     from: bounds.from,

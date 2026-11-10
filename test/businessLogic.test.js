@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
+import bcrypt from 'bcryptjs'
 import test from 'node:test'
 import { normalizePermissions } from '../src/models/User.js'
+import { changePasswordForUser } from '../src/routes/auth.routes.js'
 import {
   calculateReports,
   createEmptyDatabase,
@@ -237,6 +239,38 @@ test('receiving batch numbers use supplier code, date, and an independent saved 
   assert.equal(received.record.items[0].batchNumber, 'AA-10102026-002')
 })
 
+test('one new delivery stores multiple independently detailed items and split payments once', () => {
+  const database = databaseFixture()
+  const input = {
+    supplierId: 'supplier-1',
+    arrivalDate: '2026-10-03',
+    padNumber: 'PAD-NEW',
+    items: [
+      { productName: 'Summer Lawn', code: 'SUM-1', quantity: 2, unitCost: 10, salePrice: 16, season: 'Summer' },
+      { productName: 'Winter Shawl', code: 'WIN-1', padNumber: 'PAD-ITEM', quantity: 3, unitCost: 20, salePrice: 32, season: 'Winter' },
+    ],
+    payments: { cash: 5, bank: 10, cheque: 15 },
+    bankDetails: { bankName: 'Main Bank', accountNumber: '001' },
+    cheques: [{ number: 'NEW-CH-1', bank: 'Cheque Bank', amount: 15, issued: '2026-10-03' }],
+    idempotencyKey: 'new-delivery-multiple-items',
+  }
+  const created = receivePurchase(database, input)
+  assert.equal(created.database.purchases.length, 1)
+  assert.equal(created.record.items.length, 2)
+  assert.ok(created.record.items.every((item) => item.batchNumber === created.record.batchNumber))
+  assert.equal(created.record.items[0].padNumber, 'PAD-NEW')
+  assert.equal(created.record.items[1].padNumber, 'PAD-ITEM')
+  assert.equal(created.record.total, 80)
+  assert.equal(created.record.paid, 30)
+  assert.equal(created.record.due, 50)
+  assert.equal(created.database.suppliers[0].balance, 50)
+  assert.equal(created.database.products.length, 3)
+  assert.equal(created.database.stockMovements.filter((entry) => entry.referenceId === created.record.id).length, 2)
+  const duplicate = receivePurchase(created.database, input)
+  assert.equal(duplicate.database.purchases.length, 1)
+  assert.equal(duplicate.database.stockMovements.filter((entry) => entry.referenceId === created.record.id).length, 2)
+})
+
 test('receiving multiple supplier cheques links each pending cheque to the purchase', () => {
   const database = databaseFixture()
   const result = receivePurchase(database, {
@@ -259,6 +293,124 @@ test('receiving multiple supplier cheques links each pending cheque to the purch
   assert.equal(result.record.paid, 21)
   assert.equal(result.record.due, 0)
   assert.equal(result.database.suppliers[0].balance, 0)
+})
+
+test('receiving stock into a selected existing product updates its inventory exactly once', () => {
+  const database = databaseFixture()
+  database.products.push({ ...database.products[0], id: 'product-2', name: 'Second Item', code: 'SKU-2', stockQuantity: 8 })
+  const input = {
+    idempotencyKey: 'receive-existing-once',
+    supplierId: 'supplier-1',
+    arrivalDate: '2026-10-03',
+    items: [{ existingProductId: 'product-1', productName: 'Sample Item', code: 'SKU-1', quantity: 3, unitCost: 6, salePrice: 12 }],
+    payments: {},
+  }
+  const received = receivePurchase(database, input)
+  const product = received.database.products.find((entry) => entry.id === 'product-1')
+  assert.equal(received.database.products.length, 2)
+  assert.equal(product.stockQuantity, 13)
+  assert.equal(received.record.items[0].productId, 'product-1')
+  assert.equal(received.database.stockMovements.filter((entry) => entry.type === 'purchase' && entry.referenceId === received.record.id).length, 1)
+  const retried = receivePurchase(received.database, input)
+  assert.equal(retried.database.products.find((entry) => entry.id === 'product-1').stockQuantity, 13)
+  assert.throws(() => receivePurchase(received.database, {
+    ...input,
+    items: [{ ...input.items[0], existingProductId: 'product-2' }],
+  }), /already used for different delivery details/)
+})
+
+test('editing a received purchase reconciles its original stock, supplier due and payment records once', () => {
+  const received = receivePurchase(databaseFixture(), {
+    supplierId: 'supplier-1',
+    arrivalDate: '2026-10-03',
+    items: [{ productName: 'New Item', code: 'NEW-1', quantity: 3, unitCost: 7, salePrice: 12 }],
+    payments: { cash: 5 },
+  })
+  const line = received.record.items[0]
+  const productId = line.productId
+  const edit = {
+    purchaseId: received.record.id,
+    date: '2026-10-04',
+    padNumber: 'PAD-2',
+    items: [{ ...line, quantity: 4, unitCost: 8, salePrice: 14 }],
+    payments: { cash: 5 },
+  }
+  const changed = runDatabaseCommand(received.database, 'update-purchase', edit)
+  assert.equal(changed.record.total, 32)
+  assert.equal(changed.record.due, 27)
+  assert.equal(changed.record.date, '2026-10-04')
+  assert.equal(changed.database.suppliers[0].balance, 27)
+  assert.equal(changed.database.products.find((product) => product.id === productId).stockQuantity, 4)
+  assert.equal(changed.database.stockMovements.filter((entry) => entry.type === 'purchase' && entry.referenceId === received.record.id).length, 1)
+  assert.equal(changed.database.stockMovements.find((entry) => entry.type === 'purchase' && entry.referenceId === received.record.id).quantity, 4)
+  const repeated = runDatabaseCommand(changed.database, 'update-purchase', edit)
+  assert.equal(repeated.database.products.find((product) => product.id === productId).stockQuantity, 4)
+  assert.equal(repeated.database.suppliers[0].balance, 27)
+  assert.equal(repeated.database.payments.filter((entry) => entry.referenceId === received.record.id).length, 1)
+})
+
+test('adding stock to an existing delivery preserves its ID and original items and retries once', () => {
+  const received = receivePurchase(databaseFixture(), {
+    supplierId: 'supplier-1',
+    arrivalDate: '2026-10-03',
+    items: [{ productName: 'Original Item', code: 'ORG-1', quantity: 3, unitCost: 10, salePrice: 15 }],
+    payments: { cash: 10 },
+  })
+  const purchaseId = received.record.id
+  const originalLine = structuredClone(received.record.items[0])
+  const existingProduct = received.database.products.find((product) => product.id === 'product-1')
+  const input = {
+    purchaseId,
+    supplierId: 'supplier-1',
+    appendStock: true,
+    appendIdempotencyKey: 'append-stock-once',
+    appendItems: [
+      { productName: 'Second Item', code: 'SEC-1', padNumber: 'PAD-2', quantity: 2, unitCost: 5, salePrice: 9, season: 'Winter' },
+      { existingProductId: existingProduct.id, productName: existingProduct.name, code: existingProduct.code, quantity: 1, unitCost: 4, salePrice: 11, season: 'Summer' },
+    ],
+  }
+  const appended = runDatabaseCommand(received.database, 'update-purchase', input)
+  assert.equal(appended.record.id, purchaseId)
+  assert.deepEqual(appended.record.items[0], originalLine)
+  assert.equal(appended.record.items.length, 3)
+  assert.equal(appended.record.items[1].batchNumber, appended.record.items[2].batchNumber)
+  assert.notEqual(appended.record.items[1].batchNumber, received.record.batchNumber)
+  assert.equal(appended.record.items[1].padNumber, 'PAD-2')
+  assert.equal(appended.record.total, 44)
+  assert.equal(appended.record.paid, 10)
+  assert.equal(appended.record.due, 34)
+  assert.equal(appended.database.suppliers[0].balance, 34)
+  assert.equal(appended.database.products.find((product) => product.code === 'SEC-1').stockQuantity, 2)
+  assert.equal(appended.database.products.find((product) => product.id === existingProduct.id).stockQuantity, 11)
+  assert.equal(appended.database.stockMovements.filter((entry) => entry.referenceId === purchaseId).length, 3)
+  assert.equal(appended.database.payments.filter((entry) => entry.referenceId === purchaseId).length, 1)
+
+  const retried = runDatabaseCommand(appended.database, 'update-purchase', input)
+  assert.equal(retried.record.items.length, 3)
+  assert.equal(retried.database.products.find((product) => product.code === 'SEC-1').stockQuantity, 2)
+  assert.equal(retried.database.suppliers[0].balance, 34)
+  assert.equal(retried.database.stockMovements.filter((entry) => entry.referenceId === purchaseId).length, 3)
+  assert.throws(() => runDatabaseCommand(appended.database, 'update-purchase', {
+    ...input,
+    appendItems: [{ ...input.appendItems[0], quantity: 3 }],
+  }), /already used for different item details/)
+})
+
+test('retrying a receiving submission with the same key does not duplicate stock or payments', () => {
+  const input = {
+    idempotencyKey: 'receive-once',
+    supplierId: 'supplier-1',
+    arrivalDate: '2026-10-03',
+    items: [{ productName: 'New Item', code: 'NEW-1', quantity: 3, unitCost: 7, salePrice: 12 }],
+    payments: { cash: 5 },
+  }
+  const received = receivePurchase(databaseFixture(), input)
+  const retried = receivePurchase(received.database, input)
+  assert.equal(retried.record.id, received.record.id)
+  assert.equal(retried.database.purchases.length, received.database.purchases.length)
+  assert.equal(retried.database.products.find((product) => product.code === 'NEW-1').stockQuantity, 3)
+  assert.equal(retried.database.payments.filter((payment) => payment.referenceId === received.record.id).length, 1)
+  assert.throws(() => receivePurchase(received.database, { ...input, items: [{ ...input.items[0], quantity: 4 }] }), /already used for different delivery details/)
 })
 
 test('receiving stock carries forward an existing supplier balance and records the purchase ledger details', () => {
@@ -370,6 +522,164 @@ test('customer return credits original net rate to khata and restores sellable s
   assert.equal(result.database.products[0].stockQuantity, 9)
 })
 
+test('sale exchange calculates refund from saved prices and records the cash outflow once', () => {
+  const database = databaseFixture()
+  database.products[0].stockQuantity = 5000
+  database.products.push({
+    id: 'replacement-1',
+    name: 'Replacement Suit',
+    code: 'SKU-2',
+    stockQuantity: 2,
+    reservedQuantity: 0,
+    defectiveQuantity: 0,
+    averageCost: 1000,
+    salePrice: 2000,
+    active: true,
+  })
+  const original = createSale(database, {
+    customerId: 'customer-1',
+    date: '2026-10-18',
+    items: [{ productId: 'product-1', quantity: 5000, price: 1 }],
+    payments: { cash: 5000 },
+  })
+  const returnedLine = original.record.items[0]
+  const exchangeInput = {
+    customerId: 'customer-1',
+    date: '2026-10-18',
+    refundType: 'cash',
+    idempotencyKey: 'exchange-once',
+    items: [
+      { productId: 'replacement-1', quantity: 2, price: 2000 },
+      { isReturn: true, originalSaleId: original.record.id, originalSaleLineId: returnedLine.lineId, quantity: 5000, returnQuantity: 5000, returnCondition: 'sellable' },
+    ],
+    payments: {},
+  }
+  const exchange = createSale(original.database, exchangeInput)
+  assert.equal(exchange.record.subtotal, 4000)
+  assert.equal(exchange.record.discount, 0)
+  assert.equal(exchange.record.returnTotal, 5000)
+  assert.equal(exchange.record.total, 0)
+  assert.equal(exchange.record.refundDue, 1000)
+  assert.equal(exchange.database.products.find((product) => product.id === 'product-1').stockQuantity, 5000)
+  assert.equal(exchange.database.products.find((product) => product.id === 'replacement-1').stockQuantity, 0)
+  assert.equal(exchange.database.returns[0].amount, 5000)
+  assert.equal(exchange.database.payments.filter((entry) => entry.type === 'customer-refund' && entry.referenceId === exchange.record.id).length, 1)
+  assert.equal(calculateDailyClosing(exchange.database, '2026-10-18').cashRefunds, 1000)
+  assert.equal(calculateDailyClosing(exchange.database, '2026-10-18').expectedCash, 4000)
+
+  const retried = createSale(exchange.database, exchangeInput)
+  assert.equal(retried.record.id, exchange.record.id)
+  assert.equal(retried.database.sales.length, exchange.database.sales.length)
+  assert.equal(retried.database.payments.filter((entry) => entry.type === 'customer-refund').length, 1)
+  assert.throws(() => createSale(exchange.database, { ...exchangeInput, discount: 5 }), /already used for different transaction details/)
+  const khataExchange = createSale(original.database, { ...exchangeInput, refundType: 'khata', idempotencyKey: 'exchange-khata' })
+  assert.equal(khataExchange.database.customers[0].balance, -1000)
+  assert.equal(khataExchange.database.payments.filter((entry) => entry.type === 'customer-refund').length, 0)
+  assert.equal(calculateDailyClosing(khataExchange.database, '2026-10-18').expectedCash, 5000)
+})
+
+test('sale exchange charges only the additional payment and creates no movement for an even exchange', () => {
+  const database = databaseFixture()
+  database.products.push({
+    id: 'replacement-1',
+    name: 'Replacement Suit',
+    code: 'SKU-2',
+    stockQuantity: 2,
+    reservedQuantity: 0,
+    defectiveQuantity: 0,
+    averageCost: 4,
+    salePrice: 15,
+    active: true,
+  })
+  const original = createSale(database, {
+    customerId: 'customer-1',
+    date: '2026-10-18',
+    items: [{ productId: 'product-1', quantity: 2, price: 10 }],
+    payments: { cash: 20 },
+  })
+  const originalLine = original.record.items[0]
+  const partialExchange = createSale(original.database, {
+    customerId: 'customer-1',
+    date: '2026-10-18',
+    items: [
+      { productId: 'replacement-1', quantity: 1, price: 15 },
+      { isReturn: true, originalSaleId: original.record.id, originalSaleLineId: originalLine.lineId, quantity: 1, returnQuantity: 1 },
+    ],
+    payments: { cash: 5 },
+  })
+  assert.equal(partialExchange.record.returnTotal, 10)
+  assert.equal(partialExchange.record.total, 5)
+  assert.equal(partialExchange.database.payments.filter((entry) => entry.referenceId === partialExchange.record.id && entry.type === 'customer-payment')[0].amount, 5)
+  assert.equal(calculateDailyClosing(partialExchange.database, '2026-10-18').cashRefunds, 0)
+  assert.equal(calculateDailyClosing(partialExchange.database, '2026-10-18').expectedCash, 25)
+
+  const evenExchange = createSale(partialExchange.database, {
+    customerId: 'customer-1',
+    date: '2026-10-18',
+    items: [
+      { productId: 'product-1', quantity: 1, price: 10 },
+      { isReturn: true, originalSaleId: original.record.id, originalSaleLineId: originalLine.lineId, quantity: 1, returnQuantity: 1 },
+    ],
+    payments: {},
+  })
+  assert.equal(evenExchange.record.total, 0)
+  assert.equal(evenExchange.record.refundDue, 0)
+  assert.equal(evenExchange.database.payments.filter((entry) => entry.referenceId === evenExchange.record.id).length, 0)
+  assert.equal(calculateDailyClosing(evenExchange.database, '2026-10-18').expectedCash, 25)
+})
+
+test('customer defective returns create one linked claim without applying inventory changes twice', () => {
+  const original = createSale(databaseFixture(), {
+    customerId: 'customer-1',
+    date: '2026-10-18',
+    items: [{ productId: 'product-1', quantity: 2, price: 10 }],
+    payments: { cash: 20 },
+  })
+  const originalLine = original.record.items[0]
+  const input = {
+    customerId: 'customer-1',
+    date: '2026-10-18',
+    idempotencyKey: 'defective-return-once',
+    items: [{ isReturn: true, originalSaleId: original.record.id, originalSaleLineId: originalLine.lineId, returnQuantity: 1, returnCondition: 'damaged' }],
+    payments: {},
+  }
+  const returned = createSale(original.database, input, { actor: { id: 'user-1', name: 'Staff One' } })
+  const claim = returned.database.claims[0]
+  assert.equal(returned.database.claims.length, 1)
+  assert.equal(claim.sourceType, 'customer-return')
+  assert.equal(claim.sourceReturnId, returned.database.returns[0].id)
+  assert.equal(claim.sourceSaleId, original.record.id)
+  assert.equal(claim.customerId, 'customer-1')
+  assert.equal(claim.createdById, 'user-1')
+  assert.equal(returned.database.products[0].stockQuantity, 8)
+  assert.equal(returned.database.products[0].defectiveQuantity, 1)
+  assert.equal(returned.database.stockMovements.filter((entry) => entry.type === 'customer-return-defective').length, 1)
+
+  const retried = createSale(returned.database, input)
+  assert.equal(retried.database.claims.length, 1)
+  assert.equal(retried.database.returns.length, 1)
+  const updatedClaim = updateClaimStatus(returned.database, claim.id, 'Replacement', 'Supplier replacement requested')
+  assert.equal(updatedClaim.database.products[0].stockQuantity, 8)
+  assert.equal(updatedClaim.database.products[0].defectiveQuantity, 1)
+})
+
+test('password changes validate the current password and persist only a new password hash', async () => {
+  const user = {
+    passwordHash: await bcrypt.hash('old-password-123', 10),
+    saves: 0,
+    async save() { this.saves += 1 },
+  }
+  await assert.rejects(changePasswordForUser(user, { oldPassword: 'wrong-password', newPassword: 'new-password-123' }), /Old password is incorrect/)
+  await assert.rejects(changePasswordForUser(user, { oldPassword: 'old-password-123', newPassword: 'short' }), /at least 12 characters/)
+  await assert.rejects(changePasswordForUser(user, { oldPassword: 'old-password-123', newPassword: 'old-password-123' }), /different from the old password/)
+  assert.equal(user.saves, 0)
+
+  await changePasswordForUser(user, { oldPassword: 'old-password-123', newPassword: 'new-password-123' })
+  assert.equal(user.saves, 1)
+  assert.notEqual(user.passwordHash, 'new-password-123')
+  assert.equal(await bcrypt.compare('new-password-123', user.passwordHash), true)
+})
+
 test('approved supplier defect claim moves quarantine quantity out of defective stock', () => {
   const created = createClaim(databaseFixture(), {
     productId: 'product-1',
@@ -394,6 +704,7 @@ test('cleared incoming cheque records payment and reduces customer due', () => {
     partyId: 'customer-1',
     amount: 12,
     number: 'CHQ-1',
+    bank: 'HBL',
     expectedClearanceDate: '2026-10-05',
   })
   const cleared = updateChequeStatus(created.database, created.record.id, 'Cleared')
@@ -531,6 +842,8 @@ test('bounced cheques remain distinct and reverse the balance after prior cleara
     partyType: 'customer',
     partyId: 'customer-1',
     amount: 12,
+    number: 'CHQ-BOUNCE',
+    bank: 'HBL',
   })
   const cleared = updateChequeStatus(created.database, created.record.id, 'Cleared')
   const bounced = updateChequeStatus(cleared.database, created.record.id, 'Bounced')
