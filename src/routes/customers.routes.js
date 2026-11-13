@@ -42,6 +42,7 @@ customersRouter.get('/:id/statement', (req, res) => {
 customersRouter.post('/', mutate('create-customer'))
 customersRouter.delete('/:id', requirePermission('customers', 'delete'), asyncHandler(async (req, res, next) => { req.hasCustomerNotifications = Boolean(await Notification.exists({ relatedId: req.params.id })); next() }), mutate('delete-customer', { status: 200, input: (req) => ({ customerId: req.params.id, hasNotifications: req.hasCustomerNotifications }) }))
 customersRouter.post('/:id/payments', mutate('account-payment', { input: (req) => ({ ...req.body, accountType: 'customer', accountId: req.params.id }) }))
+customersRouter.post('/:id/adjustments', requirePermission('customers', 'edit'), mutate('customer-balance-adjustment', { input: (req) => ({ ...req.body, customerId: req.params.id }) }))
 customersRouter.patch('/:id', mutate('update-account', { status: 200, input: (req) => ({ ...req.body, accountType: 'customer', accountId: req.params.id }) }))
 customersRouter.post('/recovery/bulk', mutate('bulk-recovery'))
 customersRouter.post('/installments', mutate('create-installment'))

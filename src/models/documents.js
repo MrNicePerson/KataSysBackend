@@ -30,6 +30,7 @@ export const ARRAY_COLLECTIONS = [
   'returns',
   'supplierReturns',
   'payments',
+  'accountAdjustments',
   'cheques',
   'expenses',
   'heldOrders',

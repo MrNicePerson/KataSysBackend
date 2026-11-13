@@ -18,6 +18,7 @@ export function createEmptyDatabase() {
     returns: [],
     supplierReturns: [],
     payments: [],
+    accountAdjustments: [],
     cheques: [],
     expenses: [],
     heldOrders: [],
@@ -1062,6 +1063,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'customer-return': return processCustomerReturn(database, input)
     case 'supplier-return': return processSupplierReturn(database, input)
     case 'account-payment': return recordAccountPayment(database, input)
+    case 'customer-balance-adjustment': return recordCustomerBalanceAdjustment(database, input)
     case 'expense': return recordExpense(database, input)
     case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status, { actor: context.actor, remarks: input.remarks, bounceDate: input.bounceDate, bounceReason: input.bounceReason, bankCharges: input.bankCharges })
     case 'cheque-details': return updateChequeDetails(database, input, context.actor)
@@ -1189,6 +1191,39 @@ export function recordAccountPayment(database, input) {
   if (method === 'cheque') next = { ...next, cheques: [record('cheque', { direction: isCustomer ? 'received' : 'given', partyType: input.accountType, partyId: account.id, party: account.name, amount, number: input.cheque?.number || '', issued: dateOf(input.date), bank: input.cheque?.bank || '', referenceId: payment.id, status: 'Pending' }), ...next.cheques] }
   next = { ...next, auditHistory: addAudit(next, payment.type, payment.id, `${input.accountType} payment recorded`) }
   return { database: next, record: payment }
+}
+
+export function recordCustomerBalanceAdjustment(database, input) {
+  const customer = database.customers.find((entry) => entry.id === input.customerId)
+  if (!customer || customer.active === false) throw new Error('Choose an active saved customer.')
+  const amount = money(Number(input.amount))
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('Adjustment amount must be greater than zero.')
+  const direction = input.direction === 'credit' ? 'credit' : input.direction === 'debit' ? 'debit' : ''
+  if (!direction) throw new Error('Choose whether this adjustment adds to or reduces the amount due.')
+  const reason = String(input.reason || '').trim()
+  if (!reason) throw new Error('Enter a reason for this balance adjustment.')
+  const date = dateOf(input.date)
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const fingerprint = JSON.stringify({ customerId: customer.id, amount, direction, reason, date })
+  if (idempotencyKey) {
+    const previous = (database.accountAdjustments || []).find((entry) => entry.idempotencyKey === idempotencyKey)
+    if (previous) {
+      if (previous.fingerprint !== fingerprint) throw new Error('This adjustment submission key was already used for different details.')
+      return { database, record: previous }
+    }
+  }
+  const adjustment = record('account-adjustment', {
+    accountType: 'customer', customerId: customer.id, amount, direction, reason, date,
+    ...(idempotencyKey ? { idempotencyKey, fingerprint } : {}),
+  })
+  const customers = updateBalance(database.customers, customer.id, direction === 'debit' ? amount : -amount)
+  const next = {
+    ...database,
+    customers,
+    accountAdjustments: [adjustment, ...(database.accountAdjustments || [])],
+    auditHistory: addAudit(database, 'customer-balance-adjustment', adjustment.id, `Balance ${direction === 'debit' ? 'increased' : 'reduced'} for ${customer.name}: ${reason}`),
+  }
+  return { database: next, record: adjustment }
 }
 
 export function recordExpense(database, input) {
@@ -1540,6 +1575,7 @@ export function calculateAccountLedger(database, accountType, accountId) {
       ? database.sales.filter((sale) => sale.customerId === account.id).map((sale) => ({ id: sale.id, date: sale.date, title: `Sale ${sale.number || ''}`.trim(), amount: Number(sale.total || 0), direction: 'debit' }))
       : database.purchases.filter((purchase) => purchase.supplierId === account.id).map((purchase) => ({ id: purchase.id, date: purchase.date, title: `Stock purchase · ${receivingLabel(purchase)}`, batchNumber: receivingLabel(purchase), amount: Number(purchase.total || 0), direction: 'debit' }))),
     ...database.payments.filter((payment) => payment[isCustomer ? 'customerId' : 'supplierId'] === account.id).map((payment) => ({ id: payment.id, date: payment.date, title: payment.note || `${payment.method} ${payment.type === 'cheque-reversal' ? 'returned' : 'payment'}`, amount: Number(payment.amount || 0), direction: payment.type === 'cheque-reversal' ? 'debit' : 'credit' })),
+    ...(isCustomer ? (database.accountAdjustments || []).filter((entry) => entry.customerId === account.id).map((entry) => ({ id: entry.id, date: entry.date, title: entry.direction === 'debit' ? 'Balance increased' : 'Balance reduced', reason: entry.reason, note: entry.reason, amount: Number(entry.amount || 0), direction: entry.direction })) : []),
     ...(isCustomer
       ? database.returns.filter((entry) => entry.customerId === account.id && entry.refundType !== 'sale-adjustment').map((entry) => ({ id: entry.id, date: entry.date, title: entry.refundType === 'cash' ? `Cash refund · ${entry.itemName}` : `Khata return · ${entry.itemName}`, amount: Number(entry.amount || 0), direction: entry.refundType === 'cash' ? 'memo' : 'credit' }))
       : database.supplierReturns.filter((entry) => entry.supplierId === account.id).map((entry) => ({ id: entry.id, date: entry.date, title: `Return · ${entry.itemName}`, amount: Number(entry.amount || 0), direction: 'credit' }))),
@@ -1568,7 +1604,7 @@ export function validateBackup(data) {
   }
   if (!data || typeof data !== 'object' || data.version !== APP_DB_VERSION) throw new Error('Unsupported or invalid application backup.')
   const database = createEmptyDatabase()
-  const additiveCollections = new Set(['bankAccounts', 'bankTransactions', 'bankBalanceRecords'])
+  const additiveCollections = new Set(['bankAccounts', 'bankTransactions', 'bankBalanceRecords', 'accountAdjustments'])
   for (const key of Object.keys(database)) {
     if (Array.isArray(database[key])) {
       if (!Array.isArray(data[key]) && !additiveCollections.has(key)) throw new Error(`Backup is missing a valid ${key} collection.`)
@@ -1626,6 +1662,7 @@ function validateRelationships(database) {
     assertReference('customers', entry.customerId, 'payment/customer relationship')
     assertReference('suppliers', entry.supplierId, 'payment/supplier relationship')
   }
+  for (const entry of database.accountAdjustments || []) assertReference('customers', entry.customerId, 'customer balance adjustment/customer relationship')
   for (const entry of database.cheques) {
     assertReference(entry.partyType === 'supplier' ? 'suppliers' : 'customers', entry.partyId, 'cheque/account relationship')
   }
@@ -1947,6 +1984,7 @@ export function deleteCustomer(database, customerId, { hasNotifications = false 
     || database.returns.some((entry) => entry.customerId === customerId)
     || database.cheques.some((entry) => entry.partyType === 'customer' && entry.partyId === customerId)
     || database.installments.some((entry) => entry.customerId === customerId)
+    || (database.accountAdjustments || []).some((entry) => entry.customerId === customerId)
     || database.heldOrders.some((entry) => entry.customerId === customerId)
     || database.auditHistory.some((entry) => entry.referenceId === customerId)
   if (referenced || Number(customer.balance || 0) !== 0) {
@@ -2277,6 +2315,7 @@ export function customerStatement(database, customerId) {
     ledger: calculateAccountLedger(database, 'customer', customerId),
     sales: database.sales.filter((entry) => entry.customerId === customerId),
     payments: database.payments.filter((entry) => entry.customerId === customerId),
+    accountAdjustments: (database.accountAdjustments || []).filter((entry) => entry.customerId === customerId),
     returns: database.returns.filter((entry) => entry.customerId === customerId),
     cheques: database.cheques.filter((entry) => entry.partyId === customerId),
     installments: (database.installments || []).filter((entry) => entry.customerId === customerId),
