@@ -161,6 +161,7 @@ export function createSale(database, input, { actor = null } = {}) {
     },
     bankDetails: input.bankDetails || null,
     cheque: input.cheque || null,
+    cheques: input.cheques || [],
     paymentPromises: (input.paymentPromises || []).filter((row) => row.dueDate || String(row.amount ?? '').trim()).map(({ dueDate, amount }) => ({ dueDate, amount: Number(amount) })),
     refundType: input.refundType || 'cash',
   }) : ''
@@ -217,6 +218,18 @@ export function createSale(database, input, { actor = null } = {}) {
   const refundType = input.refundType === 'cash' ? 'cash' : 'khata'
   const split = validateSplits(total, input.payments)
   if (split.cash + split.bank + split.cheque > total + 0.005) throw new Error('Combined cash, bank and cheque payments cannot exceed the bill total.')
+  const submittedCheques = Array.isArray(input.cheques) ? input.cheques : input.cheque ? [input.cheque] : []
+  const chequeEntries = split.cheque > 0 ? submittedCheques.map((entry) => ({
+    number: String(entry.number || entry.chequeNumber || '').trim(),
+    bank: String(entry.bank || entry.bankName || '').trim(),
+    amount: amountOf(entry.amount ?? (submittedCheques.length === 1 ? split.cheque : 0)),
+    issued: dateOf(entry.issued || entry.chequeDate || input.date),
+    expectedClearanceDate: entry.expectedClearanceDate || entry.dueDate ? dateOf(entry.expectedClearanceDate || entry.dueDate) : '',
+  })) : []
+  if (split.cheque > 0 && !chequeEntries.length) throw new Error('Add at least one cheque for the cheque payment.')
+  if (chequeEntries.some((entry) => !entry.number || !entry.bank || entry.amount <= 0)) throw new Error('Each cheque needs a number, bank and positive amount.')
+  if (Math.abs(chequeEntries.reduce((sum, entry) => sum + entry.amount, 0) - split.cheque) > 0.005) throw new Error('Cheque amounts must add up to the cheque payment amount.')
+  if (new Set(chequeEntries.map((entry) => `${entry.bank.toLowerCase()}|${entry.number.toLowerCase()}`)).size !== chequeEntries.length) throw new Error('Cheque numbers must be unique within this sale.')
   if (split.credit > 0 && !input.customerId) throw new Error('Choose a customer before saving a sale with an unpaid balance.')
   const bankDetails = split.bank > 0 ? {
     bankName: String(input.bankDetails?.bankName || '').trim(),
@@ -244,6 +257,7 @@ export function createSale(database, input, { actor = null } = {}) {
     refundType: refundDue > 0 ? refundType : '',
     ...(idempotencyKey ? { idempotencyKey, idempotencyFingerprint } : {}),
     payments: { cash: split.cash, bank: split.bank, cheque: split.cheque },
+    cheques: chequeEntries,
     bankDetails,
     paid: split.cash + split.bank,
     due: split.credit,
@@ -300,7 +314,7 @@ export function createSale(database, input, { actor = null } = {}) {
   if (split.cash > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'cash', amount: split.cash, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
   if (refundDue > 0 && refundType === 'cash') next = { ...next, payments: addPayment(next, { type: 'customer-refund', method: 'cash', amount: refundDue, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
   if (split.bank > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'bank', amount: split.bank, bankDetails, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
-  if (split.cheque > 0) next = { ...next, cheques: [record('cheque', { direction: 'received', partyType: 'customer', partyId: sale.customerId, party: sale.customer, amount: split.cheque, issued: input.cheque?.chequeDate || input.cheque?.issued || sale.date, bank: input.cheque?.bank || input.cheque?.bankName || '', number: input.cheque?.number || input.cheque?.chequeNumber || '', expectedClearanceDate: input.cheque?.dueDate || input.cheque?.expectedClearanceDate || '', sourceType: 'sale', referenceId: sale.id, status: 'Pending' }), ...next.cheques] }
+  if (split.cheque > 0) next = { ...next, cheques: [...chequeEntries.map((entry) => record('cheque', { direction: 'received', partyType: 'customer', partyId: sale.customerId, party: sale.customer, ...entry, sourceType: 'sale', referenceId: sale.id, status: 'Pending' })), ...next.cheques] }
   next = { ...next, counters: { ...next.counters, sale: (next.counters.sale || 0) + 1 }, auditHistory: addAudit(next, 'sale', sale.id, `Sale ${sale.number || sale.id} recorded`) }
   return { database: next, record: sale }
 }
@@ -1172,6 +1186,18 @@ export function recordAccountPayment(database, input) {
   if (!account) throw new Error(`The ${input.accountType} account could not be found.`)
   const method = input.method || 'cash'
   if (!['cash', 'bank', 'cheque'].includes(method)) throw new Error('Payment method must be cash, bank, or cheque.')
+  const submittedCheques = Array.isArray(input.cheques) ? input.cheques : input.cheque ? [input.cheque] : []
+  const chequeEntries = method === 'cheque' ? submittedCheques.map((entry) => ({
+    number: String(entry.number || entry.chequeNumber || '').trim(),
+    bank: String(entry.bank || entry.bankName || '').trim(),
+    amount: amountOf(entry.amount ?? (submittedCheques.length === 1 ? amount : 0)),
+    issued: dateOf(entry.issued || entry.chequeDate || input.date),
+    expectedClearanceDate: entry.expectedClearanceDate || entry.dueDate ? dateOf(entry.expectedClearanceDate || entry.dueDate) : '',
+  })) : []
+  if (method === 'cheque' && !chequeEntries.length) throw new Error('Add at least one cheque for this payment.')
+  if (chequeEntries.some((entry) => !entry.number || !entry.bank || entry.amount <= 0)) throw new Error('Each cheque needs a number, bank and positive amount.')
+  if (method === 'cheque' && Math.abs(chequeEntries.reduce((sum, entry) => sum + entry.amount, 0) - amount) > 0.005) throw new Error('Cheque amounts must add up to the payment amount.')
+  if (new Set(chequeEntries.map((entry) => `${entry.bank.toLowerCase()}|${entry.number.toLowerCase()}`)).size !== chequeEntries.length) throw new Error('Cheque numbers must be unique within this payment.')
   if (isCustomer && method !== 'cheque' && amount > Math.max(0, Number(account.balance || 0)) + 0.005) throw new Error('Recovery cannot exceed the customer outstanding balance.')
   if (method === 'bank' && !String(input.bankDetails?.bankName || '').trim()) throw new Error('Choose a bank or enter bank details for this payment.')
   const bankAccount = method === 'bank' && input.bankDetails?.bankAccountId ? (database.bankAccounts || []).find((entry) => entry.id === input.bankDetails.bankAccountId && entry.active !== false) : null
@@ -1188,7 +1214,7 @@ export function recordAccountPayment(database, input) {
     const bankTransaction = record('bank-transaction', { type: 'deposit', accountId: bankAccount.id, destinationAccountId: '', source: 'bank', destination: 'bank', amount, date: payment.date, reference: payment.id, note: `Customer recovery from ${account.name}`, sourceType: 'customer-recovery' })
     next = { ...next, bankTransactions: [bankTransaction, ...(database.bankTransactions || [])] }
   }
-  if (method === 'cheque') next = { ...next, cheques: [record('cheque', { direction: isCustomer ? 'received' : 'given', partyType: input.accountType, partyId: account.id, party: account.name, amount, number: input.cheque?.number || '', issued: dateOf(input.date), bank: input.cheque?.bank || '', referenceId: payment.id, status: 'Pending' }), ...next.cheques] }
+  if (method === 'cheque') next = { ...next, cheques: [...chequeEntries.map((entry) => record('cheque', { direction: isCustomer ? 'received' : 'given', partyType: input.accountType, partyId: account.id, party: account.name, ...entry, referenceId: payment.id, status: 'Pending' })), ...next.cheques] }
   next = { ...next, auditHistory: addAudit(next, payment.type, payment.id, `${input.accountType} payment recorded`) }
   return { database: next, record: payment }
 }
@@ -1745,6 +1771,7 @@ export function completeHeldOrder(database, input) {
     payments: input.payments || held.payments || {},
     discount: input.discount ?? held.discount ?? 0,
     cheque: input.cheque || held.cheque,
+    cheques: input.cheques || held.cheques || [],
     paymentPromises: input.paymentPromises ?? held.paymentPromises ?? [],
     paymentDue: input.paymentDue || held.paymentDue || '',
     number: input.number,
@@ -1787,6 +1814,7 @@ export function partialDeliverHeldOrder(database, input) {
     payments: input.payments || {},
     discount: input.discount ?? 0,
     cheque: input.cheque,
+    cheques: input.cheques || [],
     paymentDue: input.paymentDue || '',
     number: input.number,
   })
