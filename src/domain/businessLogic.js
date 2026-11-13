@@ -1,3 +1,5 @@
+import { productEditToken, purchaseEditToken } from './stockEditToken.js'
+import { validatePaymentPromises } from './paymentPromises.js'
 import { requireDate, returnRefundAmount, validateBackupNumbers } from './inputValidation.js'
 import { nextReceivingBatch, receivingLabel } from './receiving.js'
 
@@ -158,6 +160,7 @@ export function createSale(database, input, { actor = null } = {}) {
     },
     bankDetails: input.bankDetails || null,
     cheque: input.cheque || null,
+    paymentPromises: (input.paymentPromises || []).filter((row) => row.dueDate || String(row.amount ?? '').trim()).map(({ dueDate, amount }) => ({ dueDate, amount: Number(amount) })),
     refundType: input.refundType || 'cash',
   }) : ''
   if (idempotencyKey) {
@@ -219,6 +222,7 @@ export function createSale(database, input, { actor = null } = {}) {
     accountNumber: String(input.bankDetails?.accountNumber || '').trim(),
     amount: split.bank,
   } : null
+  const paymentPromises = validatePaymentPromises(input.paymentPromises, { customerId: input.customerId, customers: database.customers, due: split.credit })
   const sale = record('sale', {
     number: input.number || `INV-${String((database.counters?.sale || 0) + 1).padStart(4, '0')}`,
     date: dateOf(input.date),
@@ -242,6 +246,7 @@ export function createSale(database, input, { actor = null } = {}) {
     bankDetails,
     paid: split.cash + split.bank,
     due: split.credit,
+    paymentPromises: paymentPromises.map((promise) => ({ ...promise, id: makeId('promise'), customerId: input.customerId, status: 'scheduled' })),
     paymentDue: input.paymentDue || '',
     status: split.credit > 0 ? 'credit' : 'paid',
   })
@@ -309,6 +314,7 @@ export function receivePurchase(database, input) {
       productId: item.productId || null,
       existingProductId: item.existingProductId || null,
       productName: item.productName ?? item.name ?? '',
+      brandName: item.brandName ?? '',
       code: item.code ?? item.articleNumber ?? '',
       padNumber: item.padNumber ?? '',
       size: item.size ?? '',
@@ -317,6 +323,12 @@ export function receivePurchase(database, input) {
       salePrice: item.salePrice ?? 0,
       season: item.season || '',
       rackLocation: item.rackLocation ?? item.location ?? '',
+      productType: item.productType || 'suit',
+      tanType: item.tanType || '',
+      tanName: item.tanName || '',
+      metersPerTan: item.metersPerTan ?? item.totalMeters ?? null,
+      buyPricePerMeter: item.buyPricePerMeter ?? null,
+      salePricePerMeter: item.salePricePerMeter ?? null,
     })),
     payments: input.payments || {},
     bankDetails: input.bankDetails || null,
@@ -413,7 +425,18 @@ export function receivePurchase(database, input) {
     const sameBatch = (entry) => item.productType !== 'tan' && entry.productType !== 'tan' &&
       entry.supplierId === supplier.id &&
       String(entry.batchNumber || '').trim().toLowerCase() === item.batchNumber.toLowerCase()
-    const reusesExistingProduct = Boolean(item.existingProductId)
+    const sameText = (left, right) => String(left || '').trim().toLowerCase() === String(right || '').trim().toLowerCase()
+    const sameMoney = (left, right) => Math.round((Number(left || 0) + Number.EPSILON) * 100) === Math.round((Number(right || 0) + Number.EPSILON) * 100)
+    const sameProductDetails = (entry) => sameBatch(entry)
+      && sameText(entry.code, item.code)
+      && sameText(entry.name, item.productName)
+      && sameText(entry.brandName, item.brandName)
+      && sameText(entry.size, item.size)
+      && sameText(entry.season, item.season)
+      && sameText(entry.rackLocation, item.rackLocation)
+      && sameMoney(entry.averageCost, item.unitCost)
+      && sameMoney(entry.salePrice, item.salePrice)
+    const reusesExistingProduct = Boolean(item.existingProductId && products.some((entry) => entry.id === item.existingProductId && sameProductDetails(entry)))
     const selectedExistingProduct = reusesExistingProduct ? products.find((entry) => entry.id === item.existingProductId) : null
     if (reusesExistingProduct && !selectedExistingProduct) throw new Error('The selected existing stock product could not be found.')
     if (selectedExistingProduct?.supplierId && selectedExistingProduct.supplierId !== supplier.id) throw new Error('Choose an existing product belonging to the selected supplier.')
@@ -429,16 +452,16 @@ export function receivePurchase(database, input) {
     let product = item.productType === 'tan' ? null : reusesExistingProduct
       ? selectedExistingProduct
       : item.productId
-        ? products.find((entry) => entry.id === item.productId && sameBatch(entry))
-      : products.find((entry) => item.code && entry.code?.toLowerCase() === item.code.toLowerCase() && sameBatch(entry))
-    if (!product && item.productName) product = products.find((entry) => entry.name.toLowerCase() === item.productName.toLowerCase() && sameBatch(entry))
+        ? products.find((entry) => entry.id === item.productId && sameProductDetails(entry))
+      : products.find(sameProductDetails)
+    if (!product && item.productName) product = products.find(sameProductDetails)
     if (product) {
       item.productId = product.id
       products = products.map((entry) => entry.id === product.id ? {
         ...entry,
         stockQuantity: Number(entry.stockQuantity || 0) + item.quantity,
         averageCost: ((Number(entry.stockQuantity || 0) * Number(entry.averageCost || 0)) + (item.quantity * item.unitCost)) / (Number(entry.stockQuantity || 0) + item.quantity || 1),
-        salePrice: item.salePrice || Number(entry.salePrice || 0),
+        salePrice: item.salePrice,
         ...(!entry.supplierId ? { supplierId: supplier.id } : {}),
         ...(!reusesExistingProduct && !item.productId ? { batchNumber: purchase.batchNumber, purchaseId: purchase.id, arrivalDate: purchase.date } : {}),
         size: item.size || entry.size || '',
@@ -471,6 +494,11 @@ export function updatePurchase(database, input) {
   const purchase = database.purchases.find((entry) => entry.id === input.purchaseId)
   if (!purchase) throw new Error('Purchase could not be found.')
   if (input.appendStock === true) return appendPurchaseItems(database, purchase, input)
+  if (input.expectedPurchaseToken != null && input.expectedPurchaseToken !== purchaseEditToken(purchase)) throw new Error('Delivery changed while you were editing. Close and reopen the editor.')
+  for (const item of purchase.items) {
+    const product = database.products.find((entry) => entry.id === item.productId)
+    if (input.expectedProductTokens && input.expectedProductTokens[item.productId] !== productEditToken(product)) throw new Error('Stock changed while you were editing this delivery. Close and reopen the editor.')
+  }
   if (input.supplierId && input.supplierId !== purchase.supplierId) throw new Error('A received purchase cannot be moved to another supplier.')
   if (database.supplierReturns.some((entry) => entry.purchaseId === purchase.id)) throw new Error('This delivery has supplier returns and cannot be edited safely.')
   if (!Array.isArray(input.items) || input.items.length > purchase.items.length) throw new Error('Delivery item lines must match the saved bill.')
@@ -589,14 +617,15 @@ export function updatePurchase(database, input) {
     const stockQuantity = Number(product.stockQuantity || 0) + deltaQuantity
     if (stockQuantity < Number(product.reservedQuantity || 0)) throw new Error(`Cannot reduce ${product.name} below its reserved or already-used stock.`)
     const costDelta = item.quantity * item.unitCost - Number(original.quantity || 0) * Number(original.unitCost || 0)
-    const averageCost = stockQuantity > 0
-      ? Math.max(0, (Number(product.stockQuantity || 0) * Number(product.averageCost || 0) + costDelta) / stockQuantity)
-      : item.unitCost
+    const sharedProduct = database.purchases.some((delivery) => delivery.id !== purchase.id && delivery.items.some((line) => line.productId === product.id))
+    if (sharedProduct) throw new Error('This legacy stock record is shared by multiple deliveries. Split its batches before editing this delivery.')
+    const averageCost = item.unitCost
     products = products.map((entry) => entry.id === product.id ? {
       ...entry,
       name: item.productName || entry.name,
       code: item.code || entry.code,
-      article: item.code || entry.article || entry.code,
+      article: item.code, articleName: item.code, articleNumber: item.code,
+      productName: item.productName, brandName: item.brandName ?? entry.brandName ?? '',
       size: item.size || '',
       season: item.season || '',
       rackLocation: item.rackLocation || '',
@@ -720,19 +749,11 @@ function appendPurchaseItems(database, purchase, input) {
       product = products.find((entry) => entry.id === item.existingProductId)
       if (!product) throw new Error('The selected existing stock product could not be found.')
       if (product.supplierId && product.supplierId !== supplier.id) throw new Error('Choose an existing product belonging to the delivery supplier.')
-      const previousQuantity = Number(product.stockQuantity || 0)
-      const nextQuantity = previousQuantity + item.quantity
-      item.productId = product.id
       item.productName ||= product.name
       item.code ||= product.code
-      products = products.map((entry) => entry.id === product.id ? {
-        ...entry,
-        stockQuantity: nextQuantity,
-        averageCost: ((previousQuantity * Number(entry.averageCost || 0)) + (item.quantity * item.unitCost)) / (nextQuantity || 1),
-        salePrice: item.salePrice || Number(entry.salePrice || 0),
-        season: item.season || entry.season || '',
-        ...(!entry.supplierId ? { supplierId: supplier.id } : {}),
-      } : entry)
+      product = record('product', { ...product, id: makeId('product'), name: item.productName, productName: item.productName, code: item.code, article: item.code, articleName: item.code, articleNumber: item.code, batchNumber, purchaseId: purchase.id, arrivalDate: date, stockQuantity: item.quantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: item.unitCost, salePrice: item.salePrice, season: item.season, active: true })
+      item.productId = product.id
+      products.push(product)
     } else {
       product = record('product', {
         name: item.productName,
@@ -801,7 +822,7 @@ export function createAccount(database, accountType, input) {
   if (!key) throw new Error('Account type must be customer or supplier.')
   const name = String(input.name || '').trim()
   if (!name) throw new Error(`${accountType} name is required.`)
-  if (database[key].some((entry) => entry.name.trim().toLowerCase() === name.toLowerCase())) throw new Error(`A ${accountType} with this name already exists.`)
+  if (database[key].some((entry) => entry.id !== input.accountId && entry.name.trim().toLowerCase() === name.toLowerCase())) throw new Error(`A ${accountType} with this name already exists.`)
   const supplierCode = accountType === 'supplier' ? String(input.supplierCode || '').trim().toUpperCase() : ''
   if (accountType === 'supplier' && supplierCode && database.suppliers.some((entry) => String(entry.supplierCode || '').trim().toUpperCase() === supplierCode)) throw new Error('A supplier with this code already exists.')
   const openingBalance = Number(input.openingBalance ?? 0)
@@ -828,7 +849,8 @@ export function createTanType(database, input) {
   const name = String(input.name || '').trim()
   if (!name) throw new Error('Tan type is required.')
   const existing = database.tanTypes || []
-  if (existing.some((entry) => entry.name.toLowerCase() === name.toLowerCase())) throw new Error('This Tan type already exists.')
+  const duplicate = existing.find((entry) => entry.name.toLowerCase() === name.toLowerCase())
+  if (duplicate) return { database, record: duplicate }
   const tanType = record('tan-type', { name, active: true })
   return { database: { ...database, tanTypes: [tanType, ...existing] }, record: tanType }
 }
@@ -1049,6 +1071,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'create-customer': return createAccount(database, 'customer', input)
     case 'create-supplier': return createAccount(database, 'supplier', input)
     case 'delete-supplier': return deleteSupplier(database, input.supplierId)
+    case 'delete-customer': return deleteCustomer(database, input.customerId, input)
     case 'create-product': return createProduct(database, input)
     case 'adjust-stock': return adjustStock(database, input)
     case 'stock-audit': return recordStockCountAudit(database, input)
@@ -1147,9 +1170,22 @@ export function recordAccountPayment(database, input) {
   if (!account) throw new Error(`The ${input.accountType} account could not be found.`)
   const method = input.method || 'cash'
   if (!['cash', 'bank', 'cheque'].includes(method)) throw new Error('Payment method must be cash, bank, or cheque.')
-  const payment = record('payment', { type: isCustomer ? 'customer-payment' : 'supplier-payment', accountType: input.accountType, method, amount, customerId: isCustomer ? account.id : undefined, supplierId: isCustomer ? undefined : account.id, referenceId: input.referenceId || '', date: dateOf(input.date), note: input.note || '' })
+  if (isCustomer && method !== 'cheque' && amount > Math.max(0, Number(account.balance || 0)) + 0.005) throw new Error('Recovery cannot exceed the customer outstanding balance.')
+  if (method === 'bank' && !String(input.bankDetails?.bankName || '').trim()) throw new Error('Choose a bank or enter bank details for this payment.')
+  const bankAccount = method === 'bank' && input.bankDetails?.bankAccountId ? (database.bankAccounts || []).find((entry) => entry.id === input.bankDetails.bankAccountId && entry.active !== false) : null
+  if (method === 'bank' && input.bankDetails?.bankAccountId && !bankAccount) throw new Error('Choose an active bank account for this payment.')
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (idempotencyKey) {
+    const duplicate = database.payments.find((entry) => entry.idempotencyKey === idempotencyKey)
+    if (duplicate) return { database, record: duplicate }
+  }
+  const payment = record('payment', { type: isCustomer ? 'customer-payment' : 'supplier-payment', accountType: input.accountType, method, amount, ...(method === 'bank' ? { bankDetails: { bankName: String(input.bankDetails.bankName).trim(), accountNumber: String(input.bankDetails.accountNumber || '').trim(), ...(bankAccount ? { bankAccountId: bankAccount.id } : {}) } } : {}), ...(idempotencyKey ? { idempotencyKey } : {}), customerId: isCustomer ? account.id : undefined, supplierId: isCustomer ? undefined : account.id, referenceId: input.referenceId || '', date: dateOf(input.date), note: input.note || '' })
   const rows = method === 'cheque' ? accountRows : updateBalance(accountRows, account.id, -amount)
   let next = { ...database, [isCustomer ? 'customers' : 'suppliers']: rows, payments: method === 'cheque' ? database.payments : [payment, ...database.payments] }
+  if (method === 'bank' && bankAccount) {
+    const bankTransaction = record('bank-transaction', { type: 'deposit', accountId: bankAccount.id, destinationAccountId: '', source: 'bank', destination: 'bank', amount, date: payment.date, reference: payment.id, note: `Customer recovery from ${account.name}`, sourceType: 'customer-recovery' })
+    next = { ...next, bankTransactions: [bankTransaction, ...(database.bankTransactions || [])] }
+  }
   if (method === 'cheque') next = { ...next, cheques: [record('cheque', { direction: isCustomer ? 'received' : 'given', partyType: input.accountType, partyId: account.id, party: account.name, amount, number: input.cheque?.number || '', issued: dateOf(input.date), bank: input.cheque?.bank || '', referenceId: payment.id, status: 'Pending' }), ...next.cheques] }
   next = { ...next, auditHistory: addAudit(next, payment.type, payment.id, `${input.accountType} payment recorded`) }
   return { database: next, record: payment }
@@ -1310,12 +1346,13 @@ export function calculateDailyClosing(database, date) {
   const bankExpenses = expensesOnDate.filter((entry) => entry.method === 'bank').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const chequeExpenses = expensesOnDate.filter((entry) => entry.method === 'cheque').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const cashRefunds = sumPayment((entry) => entry.type === 'customer-refund' && entry.method === 'cash')
+  const bankCustomerPayments = sumPayment((entry) => entry.type === 'customer-payment' && entry.method === 'bank' && !database.sales.some((sale) => sale.id === entry.referenceId))
   const cashOtherReceipts = (database.financeEntries || []).filter((entry) => sameDate(entry) && entry.type === 'capital' && entry.method === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const bankTransactions = (database.bankTransactions || []).filter((entry) => sameDate(entry))
   const cashWithdrawals = bankTransactions.filter((entry) => entry.type === 'withdrawal' && entry.destination === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const cashDeposits = bankTransactions.filter((entry) => entry.type === 'deposit' && entry.source === 'cash').reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
-  const expectedCash = money(opening + cashSales + customerPayments + cashOtherReceipts + cashWithdrawals - supplierPayments - cashExpenses - cashRefunds - cashDeposits)
-  return { date, opening, cashSales, bankSales, chequeSales, creditSales, customerPayments, cashOtherReceipts, supplierPayments, expenseTotal, cashExpenses, bankExpenses, chequeExpenses, cashRefunds, cashWithdrawals, cashDeposits, expectedCash }
+  const expectedCash = money(opening + cashSales + customerPayments + cashOtherReceipts + cashWithdrawals - cashExpenses - cashRefunds - cashDeposits)
+  return { date, opening, cashSales, bankSales, bankCustomerPayments, chequeSales, creditSales, customerPayments, cashOtherReceipts, supplierPayments, expenseTotal, cashExpenses, bankExpenses, chequeExpenses, cashRefunds, cashWithdrawals, cashDeposits, expectedCash }
 }
 
 export function calculateBankBalanceSummary(database, date) {
@@ -1502,7 +1539,7 @@ export function calculateAccountLedger(database, accountType, accountId) {
     ...(isCustomer
       ? database.sales.filter((sale) => sale.customerId === account.id).map((sale) => ({ id: sale.id, date: sale.date, title: `Sale ${sale.number || ''}`.trim(), amount: Number(sale.total || 0), direction: 'debit' }))
       : database.purchases.filter((purchase) => purchase.supplierId === account.id).map((purchase) => ({ id: purchase.id, date: purchase.date, title: `Stock purchase · ${receivingLabel(purchase)}`, batchNumber: receivingLabel(purchase), amount: Number(purchase.total || 0), direction: 'debit' }))),
-    ...database.payments.filter((payment) => payment[isCustomer ? 'customerId' : 'supplierId'] === account.id).map((payment) => ({ id: payment.id, date: payment.date, title: `${payment.method} ${payment.type === 'cheque-reversal' ? 'returned' : 'payment'}`, amount: Number(payment.amount || 0), direction: payment.type === 'cheque-reversal' ? 'debit' : 'credit' })),
+    ...database.payments.filter((payment) => payment[isCustomer ? 'customerId' : 'supplierId'] === account.id).map((payment) => ({ id: payment.id, date: payment.date, title: payment.note || `${payment.method} ${payment.type === 'cheque-reversal' ? 'returned' : 'payment'}`, amount: Number(payment.amount || 0), direction: payment.type === 'cheque-reversal' ? 'debit' : 'credit' })),
     ...(isCustomer
       ? database.returns.filter((entry) => entry.customerId === account.id && entry.refundType !== 'sale-adjustment').map((entry) => ({ id: entry.id, date: entry.date, title: entry.refundType === 'cash' ? `Cash refund · ${entry.itemName}` : `Khata return · ${entry.itemName}`, amount: Number(entry.amount || 0), direction: entry.refundType === 'cash' ? 'memo' : 'credit' }))
       : database.supplierReturns.filter((entry) => entry.supplierId === account.id).map((entry) => ({ id: entry.id, date: entry.date, title: `Return · ${entry.itemName}`, amount: Number(entry.amount || 0), direction: 'credit' }))),
@@ -1671,6 +1708,7 @@ export function completeHeldOrder(database, input) {
     payments: input.payments || held.payments || {},
     discount: input.discount ?? held.discount ?? 0,
     cheque: input.cheque || held.cheque,
+    paymentPromises: input.paymentPromises ?? held.paymentPromises ?? [],
     paymentDue: input.paymentDue || held.paymentDue || '',
     number: input.number,
   })
@@ -1765,7 +1803,7 @@ export function bulkAccountRecovery(database, input) {
       amount: item.amount,
       method,
       date: input.date,
-      note: item.note || 'Bulk recovery',
+      note: item.note || `Bulk ${method} payment`,
     })
     working = result.database
     records.push(result.record)
@@ -1839,6 +1877,7 @@ export function receiveInstallmentPayment(database, input) {
 export function updateProductDetails(database, input) {
   const product = database.products.find((entry) => entry.id === input.productId)
   if (!product) throw new Error('Product could not be found.')
+  if (input.expectedProductToken != null && input.expectedProductToken !== productEditToken(product)) throw new Error('Stock changed while you were editing. Close and reopen the editor.')
   if (input.expectedStockQuantity != null && Number(input.expectedStockQuantity) !== Number(product.stockQuantity || 0)) throw new Error('Stock changed while you were editing. Refresh and try again.')
   if (input.active === false && (Number(product.stockQuantity || 0) > 0 || Number(product.reservedQuantity || 0) > 0 || Number(product.defectiveQuantity || 0) > 0)) throw new Error('Remove or resolve all stock, reservations and defective units before deleting this product.')
   if (input.name != null && !String(input.name).trim()) throw new Error('Product name is required.')
@@ -1855,7 +1894,10 @@ export function updateProductDetails(database, input) {
     ...current,
     name: input.name == null ? product.name : String(input.name).trim(),
     code: input.code == null ? product.code : String(input.code).trim(),
-    article: input.article == null ? (input.code == null ? product.article : String(input.code).trim()) : String(input.article).trim(),
+    ...((input.article ?? input.code) != null ? { code: String(input.article ?? input.code).trim(), article: String(input.article ?? input.code).trim(), articleName: String(input.article ?? input.code).trim(), articleNumber: String(input.article ?? input.code).trim() } : {}),
+    ...(input.name != null ? { productName: String(input.name).trim() } : {}),
+    brandName: input.brandName == null ? product.brandName : String(input.brandName).trim(),
+    season: input.season == null ? product.season : String(input.season).trim(),
     rackLocation: input.rackLocation == null ? product.rackLocation : String(input.rackLocation).trim(),
     salePrice,
     averageCost,
@@ -1876,6 +1918,7 @@ export function updateAccountDetails(database, input) {
   const supplierCode = input.accountType === 'supplier' && input.supplierCode != null ? String(input.supplierCode).trim().toUpperCase() : account.supplierCode
   if (input.accountType === 'supplier' && supplierCode && database.suppliers.some((entry) => entry.id !== account.id && String(entry.supplierCode || '').trim().toUpperCase() === supplierCode)) throw new Error('A supplier with this code already exists.')
   if (input.name != null && !String(input.name).trim()) throw new Error('Account name is required.')
+  if (input.accountType === 'customer' && input.name != null && database.customers.some((entry) => entry.id !== account.id && entry.active !== false && entry.name.trim().toLowerCase() === String(input.name).trim().toLowerCase())) throw new Error('A customer with this name already exists.')
   const balance = input.accountType === 'supplier' && input.balance != null ? Number(input.balance) : Number(account.balance ?? account.openingBalance ?? 0)
   if (!Number.isFinite(balance)) throw new Error('Balance must be a valid amount.')
   const previousBalance = Number(account.balance ?? account.openingBalance ?? 0)
@@ -1887,11 +1930,30 @@ export function updateAccountDetails(database, input) {
     phone: input.phone == null ? account.phone : String(input.phone).trim(),
     address: input.address == null ? account.address : String(input.address).trim(),
     city: input.city == null ? account.city : String(input.city).trim(),
+    email: input.email == null ? account.email : String(input.email).trim(),
     notes: input.notes == null ? account.notes : String(input.notes).trim(),
     active: input.active == null ? account.active : Boolean(input.active),
   }
   const next = { ...database, [key]: database[key].map((entry) => entry.id === account.id ? updated : entry), auditHistory: addAudit(database, `${input.accountType || 'customer'}-update`, account.id, `${updated.name} details updated`) }
   return { database: next, record: updated }
+}
+
+export function deleteCustomer(database, customerId, { hasNotifications = false } = {}) {
+  const customer = database.customers.find((entry) => entry.id === customerId)
+  if (!customer) throw new Error('Customer could not be found.')
+  const referenced = hasNotifications
+    || database.sales.some((entry) => entry.customerId === customerId)
+    || database.payments.some((entry) => entry.customerId === customerId)
+    || database.returns.some((entry) => entry.customerId === customerId)
+    || database.cheques.some((entry) => entry.partyType === 'customer' && entry.partyId === customerId)
+    || database.installments.some((entry) => entry.customerId === customerId)
+    || database.heldOrders.some((entry) => entry.customerId === customerId)
+    || database.auditHistory.some((entry) => entry.referenceId === customerId)
+  if (referenced || Number(customer.balance || 0) !== 0) {
+    const archived = { ...customer, active: false }
+    return { database: { ...database, customers: database.customers.map((entry) => entry.id === customerId ? archived : entry), auditHistory: addAudit(database, 'customer-deactivate', customerId, `Customer ${customer.name} deactivated; linked history retained`) }, record: { ...archived, deactivated: true } }
+  }
+  return { database: { ...database, customers: database.customers.filter((entry) => entry.id !== customerId), auditHistory: addAudit(database, 'customer-delete', customerId, `Customer ${customer.name} deleted`) }, record: { id: customerId, deleted: true } }
 }
 
 export function deleteSupplier(database, supplierId) {
@@ -1995,6 +2057,7 @@ export function updateSaleBill(database, input) {
   if (chequeInfoChanged && activeCheque && activeCheque.status !== 'Pending') throw new Error('Only a pending cheque can be changed while editing a bill.')
   const due = Math.max(0, total - cash - bank)
   if (due > 0 && !sale.customerId) throw new Error('A bill with unpaid balance needs a customer.')
+  const editedPromises = validatePaymentPromises(input.paymentPromises ?? sale.paymentPromises, { customerId: sale.customerId, customers: database.customers, due })
   const oldByProduct = new Map()
   const newByProduct = new Map()
   for (const item of originalItems) oldByProduct.set(item.productId, (oldByProduct.get(item.productId) || 0) + Number(item.quantity || 0))
@@ -2007,6 +2070,7 @@ export function updateSaleBill(database, input) {
   const products = database.products.map((product) => ({ ...product, stockQuantity: Number(product.stockQuantity || 0) + (oldByProduct.get(product.id) || 0) - (newByProduct.get(product.id) || 0) }))
   const updated = {
     ...sale,
+    paymentPromises: editedPromises.map((promise, index) => ({ ...promise, id: sale.paymentPromises?.[index]?.id || makeId('promise'), customerId: sale.customerId, status: 'scheduled' })),
     items,
     subtotal,
     discount,
@@ -2125,7 +2189,7 @@ export function buildThermalInvoice(database, saleId) {
     receiptFooter: settings.receiptFooter || 'Thank you',
     sale,
     cheques: database.cheques.filter((entry) => entry.referenceId === sale.id),
-    customer: { ...(customer || { name: sale.customer }), phone: sale.customerPhone || customer?.phone || '', address: sale.customerAddress || customer?.address || '' },
+    customer: { ...(customer || { name: sale.customer }), name: sale.customer || customer?.name || '', phone: sale.customerPhone || customer?.phone || '', address: sale.customerAddress || customer?.address || '' },
     reprint: true,
   }
 }

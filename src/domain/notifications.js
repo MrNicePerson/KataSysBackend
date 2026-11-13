@@ -1,3 +1,4 @@
+import { paymentPromiseStates } from './paymentPromises.js'
 import { Notification } from '../models/documents.js'
 import { hasPermission, User } from '../models/User.js'
 import { getSnapshot } from '../store/snapshotStore.js'
@@ -266,6 +267,17 @@ export async function deliverDueNotifications(now = new Date()) {
     { relatedType: 'cheque-reminder', relatedId: { $in: (database.cheques || []).filter((cheque) => !['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled'].includes(cheque.status)).map((cheque) => cheque.id) }, deliveredAt: null, archivedAt: null },
     { $set: { archivedAt: now } },
   )
+  const promises = paymentPromiseStates(database)
+  const activePromiseIds = promises.filter((promise) => promise.status === 'scheduled').map((promise) => promise.id)
+  await Notification.updateMany({ relatedType: 'payment-promise', relatedId: { $nin: activePromiseIds }, archivedAt: null }, { $set: { archivedAt: now } })
+  const promiseNotifications = promises.filter((promise) => promise.status === 'scheduled').flatMap((promise) => users.filter((user) => hasPermission(user, 'notifications', 'view') && hasPermission(user, 'customers', 'view')).map((user) => ({
+    updateOne: {
+      filter: { recipientId: String(user._id), eventKey: `payment-promise:${promise.id}:${promise.dueDate}` },
+      update: { $set: { title: `Payment promise: ${promise.customer}`, message: `${promise.saleNumber}: Rs. ${promise.remaining.toLocaleString()} remaining for ${promise.dueDate}`, scheduledAt: new Date(`${promise.dueDate}T00:00:00+05:00`), deliveredAt: promise.dueDate <= today ? now : null }, $setOnInsert: { recipientId: String(user._id), eventKey: `payment-promise:${promise.id}:${promise.dueDate}`, actorId: 'system', category: 'payments', priority: 'important', permission: 'customers', relatedType: 'payment-promise', relatedId: promise.id, createdAt: now } },
+      upsert: true,
+    },
+  })))
+  if (promiseNotifications.length) await Notification.bulkWrite(promiseNotifications, { ordered: false })
   const due = await Notification.find({ deliveredAt: null, scheduledAt: { $lte: now }, archivedAt: null }).select('_id recipientId')
   if (!due.length) return
   await Notification.updateMany({ _id: { $in: due.map(({ _id }) => _id) }, deliveredAt: null }, { $set: { deliveredAt: now } })

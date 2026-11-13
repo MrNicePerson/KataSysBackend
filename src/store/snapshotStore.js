@@ -4,6 +4,7 @@ import { ARRAY_COLLECTIONS, OBJECT_KEYS, Meta, collectionModels } from '../model
 
 let cache = null
 let queue = Promise.resolve()
+const SALE_JOURNAL_ID = 'pending-sale-save'
 const RECOVERY_JOURNAL_ID = 'pending-bulk-recovery'
 const RECOVERY_COLLECTIONS = ['customers', 'payments', 'auditHistory']
 
@@ -31,6 +32,11 @@ async function recoverPendingRecovery() {
 
 export async function loadSnapshot() {
   await recoverPendingRecovery()
+  const pendingSale = await Meta.findOne({ id: SALE_JOURNAL_ID }).lean()
+  if (pendingSale) {
+    await persistSnapshot(pendingSale.value)
+    await Meta.deleteOne({ id: SALE_JOURNAL_ID })
+  }
   await collectionModels.purchases.init()
   const empty = createEmptyDatabase()
   const snapshot = { ...empty }
@@ -133,7 +139,7 @@ function describeAuditType(type, description = '') {
 
 export async function runCommand(command, input = {}, actor = null) {
   return withLock(async () => {
-    const current = await getSnapshot()
+    const current = await loadSnapshot()
     const result = runDatabaseCommand(current, command, input, { actor })
     if (actor && command !== 'restore-backup') {
       const previousIds = new Set((current.auditHistory || []).map((entry) => entry.id))
@@ -161,7 +167,17 @@ export async function runCommand(command, input = {}, actor = null) {
           await session.endSession()
         }
       } else {
-        await persistSnapshot(result.database)
+        if (['create-sale', 'complete-held-order', 'partial-deliver-held-order'].includes(command)) {
+          await Meta.create({ id: SALE_JOURNAL_ID, value: current })
+          try {
+            await persistSnapshot(result.database)
+            await Meta.deleteOne({ id: SALE_JOURNAL_ID })
+          } catch (error) {
+            cache = null
+            await loadSnapshot()
+            throw error
+          }
+        } else await persistSnapshot(result.database)
       }
     }
     return result.record

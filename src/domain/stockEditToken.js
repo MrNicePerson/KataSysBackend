@@ -1,0 +1,3 @@
+const fields = ['id', 'name', 'code', 'article', 'articleName', 'articleNumber', 'productName', 'brandName', 'batchNumber', 'purchaseId', 'stockQuantity', 'reservedQuantity', 'defectiveQuantity', 'averageCost', 'salePrice', 'productType', 'tanType', 'metersPerTan', 'salePricePerMeter', 'buyPricePerMeter', 'season', 'size', 'rackLocation', 'active']
+export const productEditToken = (product) => JSON.stringify(fields.map((key) => product?.[key] ?? null))
+export const purchaseEditToken = (purchase) => JSON.stringify([purchase?.id, purchase?.items, purchase?.date, purchase?.padNumber, purchase?.payments, purchase?.cheques, purchase?.appendOperations])
