@@ -1177,44 +1177,57 @@ export function processSupplierReturn(database, input) {
 }
 
 export function recordAccountPayment(database, input) {
-  const amount = amountOf(input.amount)
-  if (!amount) throw new Error('Payment amount must be greater than zero.')
   const isCustomer = input.accountType === 'customer'
   if (!isCustomer && input.accountType !== 'supplier') throw new Error('Account type must be customer or supplier.')
   const accountRows = isCustomer ? database.customers : database.suppliers
   const account = accountRows.find((entry) => entry.id === input.accountId)
   if (!account) throw new Error(`The ${input.accountType} account could not be found.`)
   const method = input.method || 'cash'
-  if (!['cash', 'bank', 'cheque'].includes(method)) throw new Error('Payment method must be cash, bank, or cheque.')
-  const submittedCheques = Array.isArray(input.cheques) ? input.cheques : input.cheque ? [input.cheque] : []
-  const chequeEntries = method === 'cheque' ? submittedCheques.map((entry) => ({
+  if (!['cash', 'bank', 'cheque', 'split'].includes(method)) throw new Error('Payment method must be cash, bank, cheque, or split.')
+  const split = method === 'split'
+  const splitPayments = split ? input.payments || {} : {}
+  const cash = split ? amountOf(splitPayments.cash) : method === 'cash' ? amountOf(input.amount) : 0
+  const bank = split ? amountOf(splitPayments.bank) : method === 'bank' ? amountOf(input.amount) : 0
+  const chequeAmount = split ? amountOf(splitPayments.cheque) : method === 'cheque' ? amountOf(input.amount) : 0
+  const amount = split ? cash + bank + chequeAmount : amountOf(input.amount)
+  if (!amount) throw new Error('Payment amount must be greater than zero.')
+  const submittedCheques = chequeAmount > 0 ? (Array.isArray(input.cheques) ? input.cheques : input.cheque ? [input.cheque] : []) : []
+  const chequeEntries = chequeAmount > 0 ? submittedCheques.map((entry) => ({
     number: String(entry.number || entry.chequeNumber || '').trim(),
     bank: String(entry.bank || entry.bankName || '').trim(),
-    amount: amountOf(entry.amount ?? (submittedCheques.length === 1 ? amount : 0)),
+    amount: amountOf(entry.amount ?? (submittedCheques.length === 1 ? chequeAmount : 0)),
     issued: dateOf(entry.issued || entry.chequeDate || input.date),
     expectedClearanceDate: entry.expectedClearanceDate || entry.dueDate ? dateOf(entry.expectedClearanceDate || entry.dueDate) : '',
   })) : []
-  if (method === 'cheque' && !chequeEntries.length) throw new Error('Add at least one cheque for this payment.')
+  if (chequeAmount > 0 && !chequeEntries.length) throw new Error('Add at least one cheque for this payment.')
   if (chequeEntries.some((entry) => !entry.number || !entry.bank || entry.amount <= 0)) throw new Error('Each cheque needs a number, bank and positive amount.')
-  if (method === 'cheque' && Math.abs(chequeEntries.reduce((sum, entry) => sum + entry.amount, 0) - amount) > 0.005) throw new Error('Cheque amounts must add up to the payment amount.')
+  if (chequeAmount > 0 && Math.abs(chequeEntries.reduce((sum, entry) => sum + entry.amount, 0) - chequeAmount) > 0.005) throw new Error('Cheque amounts must add up to the cheque part of this payment.')
   if (new Set(chequeEntries.map((entry) => `${entry.bank.toLowerCase()}|${entry.number.toLowerCase()}`)).size !== chequeEntries.length) throw new Error('Cheque numbers must be unique within this payment.')
-  if (isCustomer && method !== 'cheque' && amount > Math.max(0, Number(account.balance || 0)) + 0.005) throw new Error('Recovery cannot exceed the customer outstanding balance.')
-  if (method === 'bank' && !String(input.bankDetails?.bankName || '').trim()) throw new Error('Choose a bank or enter bank details for this payment.')
-  const bankAccount = method === 'bank' && input.bankDetails?.bankAccountId ? (database.bankAccounts || []).find((entry) => entry.id === input.bankDetails.bankAccountId && entry.active !== false) : null
-  if (method === 'bank' && input.bankDetails?.bankAccountId && !bankAccount) throw new Error('Choose an active bank account for this payment.')
+  const immediateAmount = split ? cash + bank : method === 'cheque' ? 0 : amount
+  if (isCustomer && immediateAmount > Math.max(0, Number(account.balance || 0)) + 0.005) throw new Error('Recovery cannot exceed the customer outstanding balance.')
+  if (bank > 0 && !String(input.bankDetails?.bankName || '').trim()) throw new Error('Choose a bank or enter bank details for this payment.')
+  const bankAccount = bank > 0 && input.bankDetails?.bankAccountId ? (database.bankAccounts || []).find((entry) => entry.id === input.bankDetails.bankAccountId && entry.active !== false) : null
+  if (bank > 0 && input.bankDetails?.bankAccountId && !bankAccount) throw new Error('Choose an active bank account for this payment.')
   const idempotencyKey = String(input.idempotencyKey || '').trim()
   if (idempotencyKey) {
     const duplicate = database.payments.find((entry) => entry.idempotencyKey === idempotencyKey)
     if (duplicate) return { database, record: duplicate }
   }
-  const payment = record('payment', { type: isCustomer ? 'customer-payment' : 'supplier-payment', accountType: input.accountType, method, amount, ...(method === 'bank' ? { bankDetails: { bankName: String(input.bankDetails.bankName).trim(), accountNumber: String(input.bankDetails.accountNumber || '').trim(), ...(bankAccount ? { bankAccountId: bankAccount.id } : {}) } } : {}), ...(idempotencyKey ? { idempotencyKey } : {}), customerId: isCustomer ? account.id : undefined, supplierId: isCustomer ? undefined : account.id, referenceId: input.referenceId || '', date: dateOf(input.date), note: input.note || '' })
-  const rows = method === 'cheque' ? accountRows : updateBalance(accountRows, account.id, -amount)
-  let next = { ...database, [isCustomer ? 'customers' : 'suppliers']: rows, payments: method === 'cheque' ? database.payments : [payment, ...database.payments] }
-  if (method === 'bank' && bankAccount) {
-    const bankTransaction = record('bank-transaction', { type: 'deposit', accountId: bankAccount.id, destinationAccountId: '', source: 'bank', destination: 'bank', amount, date: payment.date, reference: payment.id, note: `Customer recovery from ${account.name}`, sourceType: 'customer-recovery' })
+  const date = dateOf(input.date)
+  const bankDetails = bank > 0 ? { bankName: String(input.bankDetails.bankName).trim(), accountNumber: String(input.bankDetails.accountNumber || '').trim(), ...(bankAccount ? { bankAccountId: bankAccount.id } : {}) } : null
+  const payment = record('payment', { type: isCustomer ? 'customer-payment' : 'supplier-payment', accountType: input.accountType, method, amount, ...(bankDetails ? { bankDetails } : {}), ...(idempotencyKey ? { idempotencyKey } : {}), customerId: isCustomer ? account.id : undefined, supplierId: isCustomer ? undefined : account.id, referenceId: input.referenceId || '', date, note: input.note || '', ...(split ? { payments: { cash, bank, cheque: chequeAmount } } : {}) })
+  const rows = immediateAmount > 0 ? updateBalance(accountRows, account.id, -immediateAmount) : accountRows
+  const componentPayments = split ? [
+    ...(cash > 0 ? [record('payment', { type: payment.type, method: 'cash', amount: cash, customerId: isCustomer ? account.id : undefined, supplierId: isCustomer ? undefined : account.id, referenceId: payment.id, date, note: input.note || '' })] : []),
+    ...(bank > 0 ? [record('payment', { type: payment.type, method: 'bank', amount: bank, customerId: isCustomer ? account.id : undefined, supplierId: isCustomer ? undefined : account.id, referenceId: payment.id, date, note: input.note || '', bankDetails })] : []),
+  ] : []
+  const paymentRows = split ? [...componentPayments, ...database.payments] : method === 'cheque' ? database.payments : [payment, ...database.payments]
+  let next = { ...database, [isCustomer ? 'customers' : 'suppliers']: rows, payments: paymentRows }
+  if (bank > 0 && bankAccount && isCustomer) {
+    const bankTransaction = record('bank-transaction', { type: 'deposit', accountId: bankAccount.id, destinationAccountId: '', source: 'bank', destination: 'bank', amount: bank, date, reference: payment.id, note: `Customer recovery from ${account.name}`, sourceType: 'customer-recovery' })
     next = { ...next, bankTransactions: [bankTransaction, ...(database.bankTransactions || [])] }
   }
-  if (method === 'cheque') next = { ...next, cheques: [...chequeEntries.map((entry) => record('cheque', { direction: isCustomer ? 'received' : 'given', partyType: input.accountType, partyId: account.id, party: account.name, ...entry, referenceId: payment.id, status: 'Pending' })), ...next.cheques] }
+  if (chequeAmount > 0) next = { ...next, cheques: [...chequeEntries.map((entry) => record('cheque', { direction: isCustomer ? 'received' : 'given', partyType: input.accountType, partyId: account.id, party: account.name, ...entry, note: input.note || '', referenceId: payment.id, status: 'Pending' })), ...next.cheques] }
   next = { ...next, auditHistory: addAudit(next, payment.type, payment.id, `${input.accountType} payment recorded`) }
   return { database: next, record: payment }
 }
@@ -1300,7 +1313,7 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
   if (status === 'Cleared' && !cheque.appliedToBalance) {
     if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, -Number(cheque.amount || 0)) }
     if (cheque.partyType === 'supplier' && cheque.partyId) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, -Number(cheque.amount || 0)) }
-    next = { ...next, cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: true } : entry), payments: addPayment(next, { type: cheque.partyType === 'customer' ? 'customer-payment' : 'supplier-payment', method: 'cheque-cleared', amount: cheque.amount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf() }) }
+    next = { ...next, cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: true } : entry), payments: addPayment(next, { type: cheque.partyType === 'customer' ? 'customer-payment' : 'supplier-payment', method: 'cheque-cleared', amount: cheque.amount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf(), note: cheque.note || '' }) }
   }
   if (bounced && cheque.status === 'Cleared' && cheque.appliedToBalance) {
     if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, Number(cheque.amount || 0)) }
