@@ -860,6 +860,49 @@ export function createProduct(database, input) {
   return { database: next, record: product }
 }
 
+export function createDefectiveStock(database, input) {
+  const quantity = positiveQuantity(input.quantity)
+  const reason = String(input.reason || '').trim()
+  const date = dateOf(input.date)
+  let products = database.products
+  let product = input.productId ? database.products.find((entry) => entry.id === input.productId) : null
+  if (input.productId && !product) throw new Error('The selected stock product could not be found. Refresh the stock list and try again.')
+  if (product?.active === false) throw new Error('The selected stock product is inactive. Refresh the stock list and choose an active suit.')
+  if (product && product.productType === 'tan') throw new Error('Choose a suit product for this defective stock entry.')
+
+  if (product) {
+    product = { ...product, defectiveQuantity: Number(product.defectiveQuantity || 0) + quantity }
+    products = database.products.map((entry) => entry.id === product.id ? product : entry)
+  } else {
+    const code = String(input.code || makeId('defect-sku')).trim()
+    const article = String(input.article || input.articleName || '').trim() || code.toUpperCase()
+    const brandName = String(input.brandName || '').trim()
+    const name = brandName || 'Unidentified defective suit'
+    const batchNumber = String(input.batchNumber || '').trim()
+    product = record('product', {
+      name, brandName, article, articleName: article, articleNumber: article, code, batchNumber,
+      size: String(input.size || '').trim(), productType: 'suit', stockQuantity: 0, reservedQuantity: 0,
+      defectiveQuantity: quantity, averageCost: amountOf(input.averageCost ?? 0), salePrice: 0,
+      supplierId: '', active: true, defectOnly: true, defectReason: reason,
+    })
+    products = [product, ...database.products]
+  }
+
+  const result = record('defective-stock-adjustment', {
+    productId: product.id, productName: product.name, article: product.article || product.code,
+    batchNumber: product.batchNumber || '', quantity, reason, date,
+  })
+  const stockMovements = addMovement(database, {
+    productId: product.id, type: 'defective-stock-add', quantity, referenceId: result.id,
+    date, note: reason || 'Direct defective stock entry',
+  })
+  const next = {
+    ...database, products, stockMovements,
+    auditHistory: addAudit(database, 'defective-stock-add', result.id, `${quantity} defective suit${quantity === 1 ? '' : 's'} recorded for ${product.name}`),
+  }
+  return { database: next, record: result }
+}
+
 export function createTanType(database, input) {
   const name = String(input.name || '').trim()
   if (!name) throw new Error('Tan type is required.')
@@ -1089,6 +1132,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'delete-supplier': return deleteSupplier(database, input.supplierId)
     case 'delete-customer': return deleteCustomer(database, input.customerId, input)
     case 'create-product': return createProduct(database, input)
+    case 'create-defective-stock': return createDefectiveStock(database, input)
     case 'adjust-stock': return adjustStock(database, input)
     case 'stock-audit': return recordStockCountAudit(database, input)
     case 'daily-record': return saveDailyRecord(database, { ...input, branchId }, context.actor)

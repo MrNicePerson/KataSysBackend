@@ -33,6 +33,7 @@ productsRouter.get('/:id', (req, res) => {
 })
 
 productsRouter.post('/', mutate('create-product'))
+productsRouter.post('/defective', mutate('create-defective-stock'))
 productsRouter.post('/stock-audit', mutate('stock-audit'))
 productsRouter.patch('/:id', (req, res, next) => { if (!req.body?.expectedProductToken) return res.status(409).json({ error: 'Reload the updated stock editor before saving.' }); next() }, (req, res, next) => req.body?.active === false ? requirePermission('stock', 'delete')(req, res, next) : next(), mutate('update-product', { status: 200, input: (req) => ({ ...req.body, productId: req.params.id }) }))
 productsRouter.delete('/:id', mutate('update-product', { status: 200, input: (req) => ({ productId: req.params.id, active: false }) }))
