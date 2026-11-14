@@ -2104,12 +2104,17 @@ export function updateSaleBill(database, input) {
   const bank = amountOf(paymentInput?.bankTransfer ?? paymentInput?.bank ?? 0)
   const cheque = amountOf(paymentInput?.cheque ?? 0)
   if (cash + bank + cheque > total + 0.005) throw new Error('The edited total cannot be less than payments already recorded.')
+  const requestedCustomerId = input.customerId === undefined ? sale.customerId : input.customerId
+  const customerId = !requestedCustomerId || requestedCustomerId === 'walk-in' ? null : String(requestedCustomerId)
+  const customer = customerId ? database.customers.find((entry) => entry.id === customerId) : null
+  if (customerId && !customer) throw new Error('The selected customer could not be found. Refresh the customer list and try again.')
   const linkedCheques = database.cheques.filter((entry) => entry.sourceType === 'sale' && entry.referenceId === sale.id)
   const activeCheques = linkedCheques.filter((entry) => entry.status !== 'Cancelled')
-  if (input.payments && activeCheques.length > 1) throw new Error('This bill has multiple linked cheques; update those through the cheque register.')
+  const paymentSplitChanged = cash !== amountOf(sale.payments?.cash) || bank !== amountOf(sale.payments?.bank ?? sale.payments?.bankTransfer) || cheque !== amountOf(sale.payments?.cheque)
+  if (input.payments && activeCheques.length > 1 && paymentSplitChanged) throw new Error('This bill has multiple linked cheques; update those through the cheque register.')
   const activeCheque = activeCheques[0]
   const chequeInput = input.cheque || paymentInput?.chequeDetails || {}
-  const chequeInfoChanged = activeCheque && cheque > 0 && (
+  const chequeInfoChanged = activeCheques.length === 1 && activeCheque && cheque > 0 && (
     Number(activeCheque.amount || 0) !== cheque
     || String(activeCheque.number || '') !== String(chequeInput.chequeNumber ?? chequeInput.number ?? activeCheque.number ?? '')
     || String(activeCheque.bank || '') !== String(chequeInput.bankName ?? chequeInput.bank ?? activeCheque.bank ?? '')
@@ -2117,13 +2122,16 @@ export function updateSaleBill(database, input) {
     || String(activeCheque.expectedClearanceDate || '') !== String(chequeInput.dueDate ?? chequeInput.expectedClearanceDate ?? activeCheque.expectedClearanceDate ?? '')
   )
   const chequeIsSettled = activeCheque && !['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled'].includes(activeCheque.status)
-  if (input.payments && chequeIsSettled && (chequeInfoChanged || cash !== amountOf(sale.payments?.cash) || bank !== amountOf(sale.payments?.bank ?? sale.payments?.bankTransfer) || cheque !== amountOf(sale.payments?.cheque))) {
+  if (input.payments && chequeIsSettled && (chequeInfoChanged || paymentSplitChanged)) {
     throw new Error('This bill has a cleared or resolved cheque; its payment split cannot be changed safely.')
   }
   if (chequeInfoChanged && activeCheque && activeCheque.status !== 'Pending') throw new Error('Only a pending cheque can be changed while editing a bill.')
   const due = Math.max(0, total - cash - bank)
-  if (due > 0 && !sale.customerId) throw new Error('A bill with unpaid balance needs a customer.')
-  const editedPromises = validatePaymentPromises(input.paymentPromises ?? sale.paymentPromises, { customerId: sale.customerId, customers: database.customers, due })
+  const clearedChequeAmount = linkedCheques.filter((entry) => entry.appliedToBalance).reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+  const previousCustomerDue = Math.max(0, Number(sale.due || 0) - clearedChequeAmount)
+  const currentCustomerDue = Math.max(0, due - clearedChequeAmount)
+  if (due > 0 && !customerId) throw new Error('A bill with unpaid balance needs a customer.')
+  const editedPromises = validatePaymentPromises(input.paymentPromises ?? sale.paymentPromises, { customerId, customers: database.customers, due })
   const oldByProduct = new Map()
   const newByProduct = new Map()
   for (const item of originalItems) oldByProduct.set(item.productId, (oldByProduct.get(item.productId) || 0) + Number(item.quantity || 0))
@@ -2136,7 +2144,9 @@ export function updateSaleBill(database, input) {
   const products = database.products.map((product) => ({ ...product, stockQuantity: Number(product.stockQuantity || 0) + (oldByProduct.get(product.id) || 0) - (newByProduct.get(product.id) || 0) }))
   const updated = {
     ...sale,
-    paymentPromises: editedPromises.map((promise, index) => ({ ...promise, id: sale.paymentPromises?.[index]?.id || makeId('promise'), customerId: sale.customerId, status: 'scheduled' })),
+    customerId,
+    customer: customer?.name || '',
+    paymentPromises: editedPromises.map((promise, index) => ({ ...promise, id: sale.paymentPromises?.[index]?.id || makeId('promise'), customerId, status: 'scheduled' })),
     items,
     subtotal,
     discount,
@@ -2148,7 +2158,7 @@ export function updateSaleBill(database, input) {
       cash,
       bank,
       cheque,
-      chequeDetails: cheque > 0 ? {
+      chequeDetails: cheque > 0 ? (activeCheques.length > 1 ? sale.payments?.chequeDetails || null : {
         ...(sale.payments?.chequeDetails || {}),
         chequeNumber: String(chequeInput.chequeNumber ?? chequeInput.number ?? activeCheque?.number ?? '').trim(),
         bankName: String(chequeInput.bankName ?? chequeInput.bank ?? activeCheque?.bank ?? '').trim(),
@@ -2156,9 +2166,9 @@ export function updateSaleBill(database, input) {
         dueDate: String(chequeInput.dueDate ?? chequeInput.expectedClearanceDate ?? activeCheque?.expectedClearanceDate ?? '').slice(0, 10),
         amount: cheque,
         status: activeCheque?.status || 'Pending',
-      } : null,
+      }) : null,
     },
-    cheque: cheque > 0 ? {
+    cheque: cheque > 0 ? (activeCheques.length > 1 ? sale.cheque || null : {
       ...(sale.cheque || {}),
       ...chequeInput,
       chequeNumber: String(chequeInput.chequeNumber ?? chequeInput.number ?? activeCheque?.number ?? '').trim(),
@@ -2167,7 +2177,7 @@ export function updateSaleBill(database, input) {
       dueDate: String(chequeInput.dueDate ?? chequeInput.expectedClearanceDate ?? activeCheque?.expectedClearanceDate ?? '').slice(0, 10),
       amount: cheque,
       status: activeCheque?.status || 'Pending',
-    } : null,
+    }) : null,
     bankDetails: bank > 0 ? {
       bankName: String(input.bankDetails?.bankName ?? sale.bankDetails?.bankName ?? '').trim(),
       accountNumber: String(input.bankDetails?.accountNumber ?? sale.bankDetails?.accountNumber ?? '').trim(),
@@ -2185,8 +2195,19 @@ export function updateSaleBill(database, input) {
     if (originalMovement) return { ...originalMovement, productId: item.productId, quantity: -item.quantity }
     return record('move', { productId: item.productId, type: 'sale', quantity: -item.quantity, referenceId: sale.id, date: sale.date, note: sale.number || 'Sale' })
   })
-  const customers = sale.customerId ? updateBalance(database.customers, sale.customerId, due - Number(sale.due || 0)) : database.customers
+  let customers = database.customers
+  if (sale.customerId === customerId) {
+    if (customerId) customers = updateBalance(customers, customerId, currentCustomerDue - previousCustomerDue)
+  } else {
+    if (sale.customerId) customers = updateBalance(customers, sale.customerId, -previousCustomerDue)
+    if (customerId) customers = updateBalance(customers, customerId, currentCustomerDue)
+  }
   let payments = database.payments
+  if (sale.customerId !== customerId) {
+    payments = payments.map((entry) => entry.referenceId === sale.id && entry.customerId === sale.customerId
+      ? { ...entry, customerId }
+      : entry)
+  }
   if (input.payments) {
     for (const [method, amount] of [['cash', cash], ['bank', bank]]) {
       const linked = payments.filter((entry) => entry.type === 'customer-payment' && entry.referenceId === sale.id && entry.method === method)
@@ -2194,11 +2215,16 @@ export function updateSaleBill(database, input) {
       payments = payments.map((entry) => entry.type === 'customer-payment' && entry.referenceId === sale.id && entry.method === method
         ? { ...entry, amount: entry.id === keepId ? amount : 0, ...(method === 'bank' ? { bankDetails: updated.bankDetails } : {}) }
         : entry)
-      if (!linked.length && amount > 0) payments = addPayment({ ...database, payments }, { type: 'customer-payment', method, amount, ...(method === 'bank' ? { bankDetails: updated.bankDetails } : {}), customerId: sale.customerId, referenceId: sale.id, date: sale.date })
+      if (!linked.length && amount > 0) payments = addPayment({ ...database, payments }, { type: 'customer-payment', method, amount, ...(method === 'bank' ? { bankDetails: updated.bankDetails } : {}), customerId, referenceId: sale.id, date: sale.date })
     }
   }
   let cheques = database.cheques
-  if (input.payments && activeCheque && cheque > 0) {
+  if (sale.customerId !== customerId) {
+    cheques = cheques.map((entry) => entry.sourceType === 'sale' && entry.referenceId === sale.id && entry.partyId === sale.customerId
+      ? { ...entry, partyId: customerId, party: customer?.name || '' }
+      : entry)
+  }
+  if (input.payments && activeCheques.length === 1 && activeCheque && cheque > 0) {
     cheques = cheques.map((entry) => entry.id === activeCheque.id ? {
       ...entry,
       amount: cheque,
@@ -2207,18 +2233,18 @@ export function updateSaleBill(database, input) {
       issued: String(chequeInput.chequeDate ?? chequeInput.issued ?? entry.issued ?? sale.date).slice(0, 10),
       expectedClearanceDate: String(chequeInput.dueDate ?? chequeInput.expectedClearanceDate ?? entry.expectedClearanceDate ?? '').slice(0, 10),
     } : entry)
-  } else if (input.payments && activeCheque && cheque === 0) {
+  } else if (input.payments && activeCheques.length === 1 && activeCheque && cheque === 0) {
     const timestamp = now()
     cheques = cheques.map((entry) => entry.id === activeCheque.id ? { ...entry, amount: 0, status: 'Cancelled', cancelledAt: timestamp, statusHistory: [...(entry.statusHistory || []), { status: 'Cancelled', date: timestamp, remarks: 'Cheque removed while editing sale bill' }] } : entry)
-  } else if (input.payments && cheque > 0) {
+  } else if (input.payments && activeCheques.length === 0 && cheque > 0) {
     cheques = [record('cheque', {
-      direction: 'received', partyType: 'customer', partyId: sale.customerId, party: sale.customer, amount: cheque,
+      direction: 'received', partyType: 'customer', partyId: customerId, party: customer?.name || '', amount: cheque,
       issued: String(chequeInput.chequeDate ?? chequeInput.issued ?? sale.date).slice(0, 10),
       bank: String(chequeInput.bankName ?? chequeInput.bank ?? '').trim(), number: String(chequeInput.chequeNumber ?? chequeInput.number ?? '').trim(),
       expectedClearanceDate: String(chequeInput.dueDate ?? chequeInput.expectedClearanceDate ?? '').slice(0, 10), sourceType: 'sale', referenceId: sale.id, status: 'Pending',
     }), ...cheques]
   }
-  const next = { ...database, sales: database.sales.map((entry) => entry.id === sale.id ? updated : entry), products, customers, payments, cheques, stockMovements: [...retainedMovements, ...updatedMovements], auditHistory: addAudit(database, 'sale-bill-update', sale.id, `Bill ${sale.number} items, quantities, rates or payment split updated`) }
+  const next = { ...database, sales: database.sales.map((entry) => entry.id === sale.id ? updated : entry), products, customers, payments, cheques, stockMovements: [...retainedMovements, ...updatedMovements], auditHistory: addAudit(database, 'sale-bill-update', sale.id, `Bill ${sale.number} items, quantities, rates, customer or payment split updated`) }
   return { database: next, record: updated }
 }
 
