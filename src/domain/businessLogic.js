@@ -141,6 +141,7 @@ function validateSplits(total, payments) {
 export function createSale(database, input, { actor = null } = {}) {
   if (!Array.isArray(input.items) || input.items.length === 0) throw new Error('Add at least one item before saving the sale.')
   const idempotencyKey = String(input.idempotencyKey || '').trim()
+  if (input.items.some((item) => item.oldItemReturn) && !idempotencyKey) throw new Error('An old return requires a submission key.')
   const idempotencyFingerprint = idempotencyKey ? JSON.stringify({
     customerId: input.customerId || null,
     items: input.items.map((item) => ({
@@ -152,6 +153,7 @@ export function createSale(database, input, { actor = null } = {}) {
       originalSaleId: item.originalSaleId || null,
       originalSaleLineId: item.originalSaleLineId || null,
       returnCondition: item.returnCondition || '',
+      oldItemReturn: Boolean(item.oldItemReturn), name: item.name || '', code: item.code || '', supplierId: item.supplierId || '', purchaseCost: item.purchaseCost, returnValue: item.returnValue, reason: item.reason || '',
     })),
     discount: input.discount ?? 0,
     payments: {
@@ -191,6 +193,30 @@ export function createSale(database, input, { actor = null } = {}) {
     if (Number(product.stockQuantity || 0) - Number(product.reservedQuantity || 0) < requested) throw new Error(`Not enough available stock for ${product.name}.`)
   }
   const returnItems = returnInputs.map((item) => {
+    if (item.oldItemReturn) {
+      const name = String(item.name || '').trim()
+      const code = String(item.code || '').trim()
+      if (typeof item.name !== 'string' || typeof item.code !== 'string' || !name || !code) throw new Error('Old returns require an item name / brand and article code.')
+      const supplier = database.suppliers.find((entry) => entry.id === item.supplierId && entry.active !== false)
+      if (!supplier) throw new Error('Choose a valid active supplier for the old return.')
+      if (!['sellable', 'replace', 'damaged'].includes(item.returnCondition)) throw new Error('Choose Return, Replace or Defective.')
+      if (!['number', 'string'].includes(typeof item.quantity) || !String(item.quantity).trim()) throw new Error('Quantity must be a positive whole number.')
+      const quantity = positiveQuantity(item.quantity)
+      if (!Number.isSafeInteger(quantity)) throw new Error('Quantity is too large.')
+      if (!['number', 'string'].includes(typeof item.returnValue) || !String(item.returnValue).trim() || !(amountOf(item.returnValue) >= 0.01)) throw new Error('Enter a positive return value per item (at least Rs. 0.01).')
+      if (!['number', 'string'].includes(typeof item.purchaseCost) || !String(item.purchaseCost).trim()) throw new Error('Enter the stock valuation cost explicitly (zero is allowed).')
+      const purchaseCost = amountOf(item.purchaseCost)
+      // Each old return is a separate traceable batch. Never match legacy stock by code alone.
+      const product = record('product', { name, code, articleNumber: code, supplierId: supplier.id, supplier: supplier.name,
+        productType: 'suit', stockQuantity: 0, defectiveQuantity: 0, reservedQuantity: 0,
+        averageCost: purchaseCost, salePrice: amountOf(item.returnValue), active: true,
+        sourceType: 'old-customer-return', batchNumber: makeId('OLD-RETURN') })
+      if (!Number.isSafeInteger(Math.round(quantity * Number(item.returnValue) * 100)) || !Number.isSafeInteger(Math.round(quantity * purchaseCost * 100))) throw new Error('Return amount or valuation is too large.')
+      return { oldItemReturn: true, product, reason: String(item.reason || '').trim(),
+        originalSale: { id: null, number: '', customerId: input.customerId || null, customer: input.customer || '' },
+        originalItem: { ...product, productId: product.id, unitCostAtSale: purchaseCost }, quantity,
+        condition: item.returnCondition, amount: money(quantity * amountOf(item.returnValue)) }
+    }
     const originalSale = database.sales.find((sale) => sale.id === item.originalSaleId && (!input.customerId || sale.customerId === input.customerId))
     if (!originalSale) throw new Error('Each cart return must be linked to a previous sale for this customer.')
     const originalItem = item.originalSaleLineId
@@ -203,6 +229,7 @@ export function createSale(database, input, { actor = null } = {}) {
     return { originalSale, originalItem, quantity, condition: item.returnCondition || 'sellable', amount: returnRefundAmount(originalSale, originalItem, quantity, alreadyReturned) }
   })
   for (let i = 0; i < returnItems.length; i += 1) {
+    if (returnItems[i].oldItemReturn) continue
     const current = returnItems.slice(0, i).filter((entry) => entry.originalItem.lineId === returnItems[i].originalItem.lineId && entry.originalSale.id === returnItems[i].originalSale.id).reduce((sum, entry) => sum + entry.quantity, 0)
     const already = database.returns.filter((entry) => entry.saleId === returnItems[i].originalSale.id && entry.lineId === returnItems[i].originalItem.lineId).reduce((sum, entry) => sum + Number(entry.quantity || 0), 0)
     if (already + current + returnItems[i].quantity > returnItems[i].originalItem.quantity) throw new Error('Combined return quantities exceed the amount sold.')
@@ -247,7 +274,7 @@ export function createSale(database, input, { actor = null } = {}) {
     customerPhone: input.customerPhone || '',
     customerAddress: input.customerAddress || '',
     padInvoiceNumber: input.padInvoiceNumber || input.paidInvoiceNumber || '',
-    items: [...saleItems, ...returnItems.map(({ originalSale, originalItem, quantity, condition, amount }) => ({ lineId: makeId('line'), productId: originalItem.productId, code: originalItem.code, name: `Return · ${originalItem.name}`, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || '', metersPerTan: originalItem.metersPerTan, quantity, price: originalItem.productType === 'tan' ? -Number(originalItem.price ?? originalItem.unitPrice ?? 0) : -amount / quantity, unitPrice: originalItem.productType === 'tan' ? -Number(originalItem.unitPrice ?? originalItem.price ?? 0) : -amount / quantity, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), lineTotal: -amount, isReturn: true, returnCondition: condition, originalSaleId: originalSale.id, originalSaleLineId: originalItem.lineId }))],
+    items: [...saleItems, ...returnItems.map(({ originalSale, originalItem, quantity, condition, amount, oldItemReturn, product, reason }) => ({ oldItemReturn: Boolean(oldItemReturn), sourceType: oldItemReturn ? 'old-customer-return' : 'customer-return', supplierId: product?.supplierId || null, reason: reason || '', lineId: makeId('line'), productId: originalItem.productId, code: originalItem.code, name: `Return · ${originalItem.name}`, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || '', metersPerTan: originalItem.metersPerTan, quantity, price: originalItem.productType === 'tan' ? -Number(originalItem.price ?? originalItem.unitPrice ?? 0) : -amount / quantity, unitPrice: originalItem.productType === 'tan' ? -Number(originalItem.unitPrice ?? originalItem.price ?? 0) : -amount / quantity, unitCostAtSale: Number(originalItem.unitCostAtSale || 0), lineTotal: -amount, isReturn: true, returnCondition: condition, originalSaleId: originalSale.id, originalSaleLineId: originalItem.lineId }))],
     subtotal,
     discount,
     returnTotal,
@@ -265,10 +292,10 @@ export function createSale(database, input, { actor = null } = {}) {
     paymentDue: input.paymentDue || '',
     status: split.credit > 0 ? 'credit' : 'paid',
   })
-  let products = database.products.map((product) => {
+  let products = [...database.products, ...returnItems.filter((item) => item.oldItemReturn).map((item) => item.product)].map((product) => {
     const sold = saleItems.filter((item) => item.productId === product.id).reduce((sum, item) => sum + item.quantity, 0)
-    const returnedSellable = returnItems.filter((item) => item.originalItem.productId === product.id && item.condition === 'sellable').reduce((sum, item) => sum + item.quantity, 0)
-    const returnedDefective = returnItems.filter((item) => item.originalItem.productId === product.id && item.condition !== 'sellable').reduce((sum, item) => sum + item.quantity, 0)
+    const returnedSellable = returnItems.filter((item) => item.originalItem.productId === product.id && (item.condition === 'sellable' || item.oldItemReturn && item.condition === 'replace')).reduce((sum, item) => sum + item.quantity, 0)
+    const returnedDefective = returnItems.filter((item) => item.originalItem.productId === product.id && item.condition !== 'sellable' && !(item.oldItemReturn && item.condition === 'replace')).reduce((sum, item) => sum + item.quantity, 0)
     return sold || returnedSellable || returnedDefective ? { ...product, stockQuantity: Number(product.stockQuantity || 0) - sold + returnedSellable, defectiveQuantity: Number(product.defectiveQuantity || 0) + returnedDefective } : product
   })
   let stockMovements = database.stockMovements
@@ -278,9 +305,17 @@ export function createSale(database, input, { actor = null } = {}) {
   for (const item of returnItems) {
     const returnRecord = record('return', { saleId: item.originalSale.id, saleNumber: item.originalSale.number, adjustmentSaleId: sale.id, customerId: item.originalSale.customerId, productId: item.originalItem.productId, lineId: item.originalItem.lineId, code: item.originalItem.code, itemName: item.originalItem.name, productType: item.originalItem.productType || 'suit', tanType: item.originalItem.tanType || '', batchNumber: item.originalItem.batchNumber || '', metersPerTan: item.originalItem.metersPerTan, quantity: item.quantity, unitPrice: item.amount / item.quantity, amount: item.amount, condition: item.condition, refundType: refundDue > 0 ? refundType : 'sale-adjustment', date: sale.date })
     returnRecords.push(returnRecord)
-    stockMovements = addMovement({ ...database, stockMovements }, { productId: item.originalItem.productId, type: item.condition === 'sellable' ? 'customer-return' : 'customer-return-defective', quantity: item.quantity, referenceId: returnRecord.id, date: sale.date, note: item.originalSale.number })
+    Object.assign(returnRecord, { sourceType: item.oldItemReturn ? 'old-customer-return' : 'customer-return',
+      customer: sale.customer,
+      supplierId: item.product?.supplierId || products.find((entry) => entry.id === item.originalItem.productId)?.supplierId || null,
+      unitCostAtSale: Number(item.originalItem.unitCostAtSale || 0), reason: item.reason || '',
+      // The bill already offsets the purchase. Only the excess settles separately.
+      settlementAmount: returnTotal ? money(item.amount / returnTotal * refundDue) : 0 })
+    if (item.oldItemReturn) products = products.map((product) => product.id === item.originalItem.productId
+      ? { ...product, sourceReturnId: returnRecord.id, adjustmentSaleId: sale.id, customerId: sale.customerId } : product)
+    stockMovements = addMovement({ ...database, stockMovements }, { productId: item.originalItem.productId, type: item.oldItemReturn ? (item.condition === 'damaged' ? 'old-customer-return-defective' : 'old-customer-return') : item.condition === 'sellable' ? 'customer-return' : 'customer-return-defective', quantity: item.quantity, referenceId: returnRecord.id, date: sale.date, note: item.oldItemReturn ? `Old customer return (${sale.number}), supplier ${item.product.supplierId}` : item.originalSale.number })
     if (item.condition === 'damaged') {
-      const product = database.products.find((entry) => entry.id === item.originalItem.productId)
+      const product = products.find((entry) => entry.id === item.originalItem.productId)
       const claim = record('claim', {
         productId: item.originalItem.productId,
         productName: item.originalItem.name,
@@ -304,6 +339,7 @@ export function createSale(database, input, { actor = null } = {}) {
         createdByName: actor?.name || '',
       })
       claims = [claim, ...claims]
+      if (item.oldItemReturn) Object.assign(claim, { sourceType: 'old-customer-return', returnValue: item.amount, inventoryManagedBySource: false, description: item.reason || 'Old customer return' })
     }
   }
   let customers = database.customers
@@ -1627,7 +1663,7 @@ export function calculateBusinessTotals(database) {
   const separateReturnAmount = returnsProcessedSeparately.reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
   const netSales = database.sales.reduce((sum, sale) => sum + getNetBill(sale), 0) - separateReturnAmount
   const billCost = database.sales.reduce((sum, sale) => sum + (sale.items || []).reduce((subtotal, item) => {
-    const direction = item.isReturn && item.returnCondition === 'sellable' ? -1 : 1
+    const direction = item.oldItemReturn && item.returnCondition === 'damaged' ? 0 : item.isReturn && (item.returnCondition === 'sellable' || item.oldItemReturn && item.returnCondition === 'replace') ? -1 : 1
     return subtotal + direction * Number(item.quantity || 0) * Number(item.unitCostAtSale || 0)
   }, 0), 0)
   const separateSellableReturnCost = returnsProcessedSeparately.filter((entry) => entry.condition === 'sellable' || entry.condition === 'Sellable stock').reduce((sum, entry) => sum + Number(entry.quantity || 0) * Number(entry.unitCostAtSale || 0), 0)
