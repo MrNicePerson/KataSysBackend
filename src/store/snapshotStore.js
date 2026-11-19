@@ -4,7 +4,7 @@ import { ARRAY_COLLECTIONS, OBJECT_KEYS, Meta, collectionModels } from '../model
 
 let cache = null
 let queue = Promise.resolve()
-const SALE_JOURNAL_ID = 'pending-sale-save'
+const SNAPSHOT_JOURNAL_ID = 'pending-snapshot-save'
 const RECOVERY_JOURNAL_ID = 'pending-bulk-recovery'
 const RECOVERY_COLLECTIONS = ['customers', 'payments', 'auditHistory']
 
@@ -32,10 +32,10 @@ async function recoverPendingRecovery() {
 
 export async function loadSnapshot() {
   await recoverPendingRecovery()
-  const pendingSale = await Meta.findOne({ id: SALE_JOURNAL_ID }).lean()
-  if (pendingSale) {
-    await persistSnapshot(pendingSale.value)
-    await Meta.deleteOne({ id: SALE_JOURNAL_ID })
+  const pendingSnapshot = await Meta.findOne({ id: SNAPSHOT_JOURNAL_ID }).lean()
+  if (pendingSnapshot) {
+    await persistSnapshot(pendingSnapshot.value)
+    await Meta.deleteOne({ id: SNAPSHOT_JOURNAL_ID })
   }
   await collectionModels.purchases.init()
   const empty = createEmptyDatabase()
@@ -47,8 +47,79 @@ export async function loadSnapshot() {
   const meta = await Meta.find({ id: { $in: OBJECT_KEYS } }).lean()
   for (const item of meta) snapshot[item.id] = item.value || empty[item.id]
   snapshot.version = empty.version
+  if (reconcileReceivedStock(snapshot)) {
+    await Meta.create({ id: SNAPSHOT_JOURNAL_ID, value: snapshot })
+    try {
+      await persistSnapshot(snapshot)
+      await Meta.deleteOne({ id: SNAPSHOT_JOURNAL_ID })
+    } catch (error) {
+      cache = null
+      throw error
+    }
+  }
   cache = snapshot
   return snapshot
+}
+
+function reconcileReceivedStock(snapshot) {
+  let changed = false
+  for (const purchase of snapshot.purchases || []) {
+    for (const [index, item] of (purchase.items || []).entries()) {
+      if (item.productId && snapshot.products.some((product) => product.id === item.productId)) continue
+      const itemCode = String(item.code || item.articleNumber || '').trim().toLowerCase()
+      const itemName = String(item.productName || item.name || '').trim().toLowerCase()
+      const itemBatch = String(item.batchNumber || purchase.batchNumber || '').trim().toLowerCase()
+      const candidates = snapshot.products.filter((product) => {
+        if (product.purchaseId !== purchase.id || String(product.batchNumber || '').trim().toLowerCase() !== itemBatch) return false
+        const productCode = String(product.code || product.articleNumber || '').trim().toLowerCase()
+        const productName = String(product.name || product.productName || '').trim().toLowerCase()
+        return (!itemCode || productCode === itemCode) && (!itemName || productName === itemName)
+      })
+      if (candidates.length === 1) {
+        item.productId = candidates[0].id
+        changed = true
+        continue
+      }
+      if (candidates.length > 1 || !(Number(item.quantity) > 0)) continue
+      const product = {
+        id: `product-recovered-${purchase.id}-${item.lineId || index}`,
+        name: String(item.productName || item.name || item.code || item.articleNumber || 'Recovered received item'),
+        code: String(item.code || item.articleNumber || `recovered-${purchase.id}-${index}`),
+        article: String(item.code || item.articleNumber || ''),
+        articleNumber: String(item.code || item.articleNumber || ''),
+        brandName: String(item.brandName || ''),
+        supplierId: purchase.supplierId,
+        supplier: purchase.supplier,
+        batchNumber: item.batchNumber || purchase.batchNumber || '',
+        purchaseId: purchase.id,
+        purchaseItemId: item.lineId || '',
+        arrivalDate: purchase.date,
+        season: item.season || '',
+        size: item.size || '',
+        rackLocation: item.rackLocation || '',
+        productType: item.productType === 'tan' ? 'tan' : 'suit',
+        stockQuantity: Number(item.quantity || 0),
+        reservedQuantity: 0,
+        defectiveQuantity: 0,
+        averageCost: Number(item.unitCost || 0),
+        salePrice: Number(item.salePrice || 0),
+        active: true,
+      }
+      if (product.productType === 'tan') Object.assign(product, {
+        tanType: item.tanType || '', metersPerTan: Number(item.metersPerTan || 0),
+        buyPricePerMeter: Number(item.buyPricePerMeter || 0), salePricePerMeter: Number(item.salePricePerMeter || 0),
+      })
+      snapshot.products.push(product)
+      item.productId = product.id
+      snapshot.stockMovements.push({
+        id: `move-recovered-${purchase.id}-${item.lineId || index}`, productId: product.id,
+        type: 'purchase', quantity: product.stockQuantity, referenceId: purchase.id,
+        date: purchase.date, note: product.batchNumber,
+      })
+      changed = true
+    }
+  }
+  return changed
 }
 
 export async function getSnapshot() {
@@ -80,12 +151,12 @@ async function persistSnapshot(snapshot, session = null) {
       { upsert: true, session },
     )
   } else {
-    await Promise.all(ARRAY_COLLECTIONS.map(persistCollection))
-    await Promise.all(OBJECT_KEYS.map((key) => Meta.replaceOne(
+    for (const name of ARRAY_COLLECTIONS) await persistCollection(name)
+    for (const key of OBJECT_KEYS) await Meta.replaceOne(
       { id: key },
       { id: key, value: snapshot[key] || {} },
       { upsert: true },
-    )))
+    )
   }
   if (!session) cache = snapshot
 }
@@ -167,17 +238,15 @@ export async function runCommand(command, input = {}, actor = null) {
           await session.endSession()
         }
       } else {
-        if (['create-sale', 'complete-held-order', 'partial-deliver-held-order'].includes(command)) {
-          await Meta.create({ id: SALE_JOURNAL_ID, value: current })
-          try {
-            await persistSnapshot(result.database)
-            await Meta.deleteOne({ id: SALE_JOURNAL_ID })
-          } catch (error) {
-            cache = null
-            await loadSnapshot()
-            throw error
-          }
-        } else await persistSnapshot(result.database)
+        await Meta.create({ id: SNAPSHOT_JOURNAL_ID, value: current })
+        try {
+          await persistSnapshot(result.database)
+          await Meta.deleteOne({ id: SNAPSHOT_JOURNAL_ID })
+        } catch (error) {
+          cache = null
+          await loadSnapshot()
+          throw error
+        }
       }
     }
     return result.record
