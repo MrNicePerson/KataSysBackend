@@ -1160,6 +1160,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'expense': return recordExpense(database, input)
     case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status, { actor: context.actor, remarks: input.remarks, bounceDate: input.bounceDate, bounceReason: input.bounceReason, bankCharges: input.bankCharges })
     case 'cheque-details': return updateChequeDetails(database, input, context.actor)
+    case 'delete-cheque': return deletePendingCheque(database, input.chequeId, context.actor)
     case 'hold-order': return recordHeldOrder(database, input)
     case 'release-held-order': return releaseHeldOrder(database, input.heldId, 'resumed')
     case 'discard-held-order': return releaseHeldOrder(database, input.heldId, 'discarded')
@@ -1431,6 +1432,14 @@ export function updateChequeDetails(database, input, actor = null) {
   }
   const next = { ...database, cheques: database.cheques.map((entry) => entry.id === cheque.id ? updated : entry), auditHistory: [...database.auditHistory, record('audit', { type: changedDate ? 'cheque-rescheduled' : 'cheque-follow-up', referenceId: cheque.id, description: changedDate ? `Cheque rescheduled from ${oldDate} to ${dueDate}: ${remark}` : `Cheque follow-up updated${remark ? `: ${remark}` : ''}`, date: timestamp, userId: String(actor?._id || ''), userName: actor?.name || '' })] }
   return { database: next, record: updated }
+}
+
+export function deletePendingCheque(database, chequeId, actor = null) {
+  const cheque = database.cheques.find((entry) => entry.id === chequeId)
+  if (!cheque) throw new Error('Cheque could not be found.')
+  if (cheque.status !== 'Pending') throw new Error('Only pending cheques can be deleted. Update cleared or returned cheques through their status instead.')
+  const next = { ...database, cheques: database.cheques.filter((entry) => entry.id !== chequeId), auditHistory: addAudit(database, 'cheque-delete', cheque.id, `Pending cheque ${cheque.number || cheque.id} deleted`) }
+  return { database: next, record: cheque }
 }
 
 export function recordHeldOrder(database, input) {
@@ -1801,6 +1810,22 @@ function validateRelationships(database) {
 }
 
 export function createManualCheque(database, input, actor = null) {
+  const idempotencyKey = String(input.idempotencyKey || '').trim()
+  const actorId = String(actor?._id || actor?.id || '')
+  const fingerprint = idempotencyKey ? JSON.stringify({
+    direction: input.direction || 'received', partyType: input.partyType || '', partyId: input.partyId || '',
+    amount: Number(input.amount), number: String(input.number || '').trim(), bank: String(input.bank || '').trim(),
+    issued: input.issued || input.date || '', dueDate: input.dueDate || '',
+    expectedClearanceDate: input.expectedClearanceDate || '', notes: String(input.notes || '').trim(),
+    sourceType: input.sourceType || 'manual', referenceId: input.referenceId || '',
+  }) : ''
+  if (idempotencyKey) {
+    const existing = database.cheques.find((entry) => entry.idempotencyKey === idempotencyKey && entry.idempotencyActorId === actorId)
+    if (existing) {
+      if (existing.idempotencyFingerprint !== fingerprint) throw new Error('This cheque submission key was already used for different details.')
+      return { database, record: existing }
+    }
+  }
   const amount = amountOf(input.amount)
   if (!amount) throw new Error('Cheque amount must be greater than zero.')
   if (input.direction && !['given', 'received'].includes(input.direction)) throw new Error('Cheque direction must be received or given.')
@@ -1829,6 +1854,7 @@ export function createManualCheque(database, input, actor = null) {
     sourceType: input.sourceType || 'manual',
     referenceId: input.referenceId || '',
     status: 'Pending',
+    ...(idempotencyKey ? { idempotencyKey, idempotencyFingerprint: fingerprint, idempotencyActorId: actorId } : {}),
     createdById: String(actor?._id || ''),
     createdByName: actor?.name || '',
   })
