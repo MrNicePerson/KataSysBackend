@@ -65,7 +65,19 @@ function reconcileReceivedStock(snapshot) {
   let changed = false
   for (const purchase of snapshot.purchases || []) {
     for (const [index, item] of (purchase.items || []).entries()) {
-      if (item.productId && snapshot.products.some((product) => product.id === item.productId)) continue
+      const linkedProduct = item.productId
+        ? snapshot.products.find((product) => product.id === item.productId)
+        : null
+      if (linkedProduct) {
+        // Stock & products and New Sale both hide inactive records. A legacy
+        // receipt can still point at one that has positive stock, so restore
+        // visibility without changing its quantity or recorded sale history.
+        if (linkedProduct.active === false && Number(linkedProduct.stockQuantity || 0) > 0) {
+          linkedProduct.active = true
+          changed = true
+        }
+        continue
+      }
       const itemCode = String(item.code || item.articleNumber || '').trim().toLowerCase()
       const itemName = String(item.productName || item.name || '').trim().toLowerCase()
       const itemBatch = String(item.batchNumber || purchase.batchNumber || '').trim().toLowerCase()
@@ -78,6 +90,9 @@ function reconcileReceivedStock(snapshot) {
       if (candidates.length === 1) {
         item.productId = candidates[0].id
         changed = true
+        if (candidates[0].active === false && Number(candidates[0].stockQuantity || 0) > 0) {
+          candidates[0].active = true
+        }
         continue
       }
       if (candidates.length > 1 || !(Number(item.quantity) > 0)) continue
