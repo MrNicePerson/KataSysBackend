@@ -513,6 +513,8 @@ export function receivePurchase(database, input) {
         stockQuantity: Number(entry.stockQuantity || 0) + item.quantity,
         averageCost: ((Number(entry.stockQuantity || 0) * Number(entry.averageCost || 0)) + (item.quantity * item.unitCost)) / (Number(entry.stockQuantity || 0) + item.quantity || 1),
         salePrice: item.salePrice,
+        ...(item.brandName ? { brandName: item.brandName } : {}),
+        ...(item.code ? { article: item.code, articleNumber: item.code } : {}),
         ...(!entry.supplierId ? { supplierId: supplier.id } : {}),
         ...(!reusesExistingProduct && !item.productId ? { batchNumber: purchase.batchNumber, purchaseId: purchase.id, arrivalDate: purchase.date } : {}),
         size: item.size || entry.size || '',
@@ -521,7 +523,8 @@ export function receivePurchase(database, input) {
       } : entry)
       stockMovements = addMovement({ ...database, stockMovements }, { productId: product.id, type: 'purchase', quantity: item.quantity, referenceId: purchase.id, date: purchase.date, note: item.batchNumber })
     } else {
-      const newProduct = record('product', { name: item.productName, code: item.code || makeId('sku'), categoryId: null, size: item.size, season: item.season, stockQuantity: item.quantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: item.unitCost, salePrice: item.salePrice, supplierId: supplier.id, batchNumber: item.batchNumber, rackLocation: item.rackLocation, active: true, ...(item.productType === 'tan' ? { productType: 'tan', tanType: item.tanType, metersPerTan: item.metersPerTan, buyPricePerMeter: item.buyPricePerMeter, salePricePerMeter: item.salePricePerMeter } : {}) })
+      const article = item.code || makeId('sku')
+      const newProduct = record('product', { name: item.productName, code: article, article, articleNumber: article, brandName: item.brandName || '', categoryId: null, size: item.size, season: item.season, stockQuantity: item.quantity, reservedQuantity: 0, defectiveQuantity: 0, averageCost: item.unitCost, salePrice: item.salePrice, supplierId: supplier.id, batchNumber: item.batchNumber, rackLocation: item.rackLocation, active: true, ...(item.productType === 'tan' ? { productType: 'tan', tanType: item.tanType, metersPerTan: item.metersPerTan, buyPricePerMeter: item.buyPricePerMeter, salePricePerMeter: item.salePricePerMeter } : {}) })
       newProduct.purchaseId = purchase.id
       newProduct.arrivalDate = purchase.date
       products.push(newProduct)
