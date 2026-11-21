@@ -2097,6 +2097,7 @@ export function updateProductDetails(database, input) {
     })() : input.productType === 'suit' ? { productType: 'suit', tanType: '', metersPerTan: undefined, buyPricePerMeter: undefined, salePricePerMeter: undefined } : product.productType === 'tan' && Number(product.metersPerTan) > 0 ? { salePricePerMeter: Number(salePrice || 0) / Number(product.metersPerTan), buyPricePerMeter: Number(averageCost || 0) / Number(product.metersPerTan) } : {}),
     labels: input.labels == null ? product.labels || [] : input.labels,
     active: input.active == null ? product.active : Boolean(input.active),
+    archivedAt: input.active === false ? (product.archivedAt || now()) : input.active === true ? null : product.archivedAt,
     size: input.size == null ? product.size : String(input.size).trim(),
     color: input.color == null ? product.color : String(input.color).trim(),
   }

@@ -69,10 +69,53 @@ function reconcileReceivedStock(snapshot) {
         ? snapshot.products.find((product) => product.id === item.productId)
         : null
       if (linkedProduct) {
+        // Restore Tan metadata only from an explicitly Tan-typed purchase line.
+        // Keep any valid product values so later edits are never overwritten.
+        if (item.productType === 'tan' && Number(item.metersPerTan) > 0) {
+          const metersPerTan = Number(item.metersPerTan)
+          const buyPricePerMeter = item.buyPricePerMeter != null
+            ? Number(item.buyPricePerMeter)
+            : Number(item.unitCost) / metersPerTan
+          const salePricePerMeter = item.salePricePerMeter != null
+            ? Number(item.salePricePerMeter)
+            : Number(item.salePrice) / metersPerTan
+          if (linkedProduct.productType !== 'tan') {
+            linkedProduct.productType = 'tan'
+            changed = true
+          }
+          if (!linkedProduct.tanType && item.tanType) {
+            linkedProduct.tanType = item.tanType
+            changed = true
+          }
+          if (!(Number(linkedProduct.metersPerTan) > 0)) {
+            linkedProduct.metersPerTan = metersPerTan
+            changed = true
+          }
+          if (linkedProduct.buyPricePerMeter == null || Number(linkedProduct.buyPricePerMeter) === 0) {
+            if (Number.isFinite(buyPricePerMeter) && buyPricePerMeter >= 0) {
+              linkedProduct.buyPricePerMeter = buyPricePerMeter
+              changed = true
+            }
+          }
+          if (linkedProduct.salePricePerMeter == null || Number(linkedProduct.salePricePerMeter) === 0) {
+            if (Number.isFinite(salePricePerMeter) && salePricePerMeter >= 0) {
+              linkedProduct.salePricePerMeter = salePricePerMeter
+              changed = true
+            }
+          }
+          if (linkedProduct.averageCost == null && item.unitCost != null) {
+            linkedProduct.averageCost = Number(item.unitCost)
+            changed = true
+          }
+          if (linkedProduct.salePrice == null && item.salePrice != null) {
+            linkedProduct.salePrice = Number(item.salePrice)
+            changed = true
+          }
+        }
         // Stock & products and New Sale both hide inactive records. A legacy
         // receipt can still point at one that has positive stock, so restore
         // visibility without changing its quantity or recorded sale history.
-        if (linkedProduct.active === false && Number(linkedProduct.stockQuantity || 0) > 0) {
+        if (linkedProduct.active === false && !linkedProduct.archivedAt && Number(linkedProduct.stockQuantity || 0) > 0) {
           linkedProduct.active = true
           changed = true
         }
@@ -90,7 +133,7 @@ function reconcileReceivedStock(snapshot) {
       if (candidates.length === 1) {
         item.productId = candidates[0].id
         changed = true
-        if (candidates[0].active === false && Number(candidates[0].stockQuantity || 0) > 0) {
+        if (candidates[0].active === false && !candidates[0].archivedAt && Number(candidates[0].stockQuantity || 0) > 0) {
           candidates[0].active = true
         }
         continue
