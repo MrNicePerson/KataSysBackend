@@ -2455,7 +2455,7 @@ export function stockAudit(database) {
     stockQuantity: Number(product.stockQuantity || 0),
     averageCost: Number(product.averageCost || 0),
     salePrice: Number(product.salePrice || 0),
-    stockValue: Number(product.stockQuantity || 0) * Number(product.averageCost || 0),
+    stockValue: Math.max(0, Number(product.stockQuantity || 0) - Number(product.reservedQuantity || 0)) * Number(product.averageCost || 0),
   }))
 }
 
