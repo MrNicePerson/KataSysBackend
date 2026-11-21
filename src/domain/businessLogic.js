@@ -2088,7 +2088,13 @@ export function updateProductDetails(database, input) {
     rackLocation: input.rackLocation == null ? product.rackLocation : String(input.rackLocation).trim(),
     salePrice,
     averageCost,
-    ...(product.productType === 'tan' && Number(product.metersPerTan) > 0 ? { salePricePerMeter: Number(salePrice || 0) / Number(product.metersPerTan), buyPricePerMeter: Number(averageCost || 0) / Number(product.metersPerTan) } : {}),
+    ...(input.productType === 'tan' ? (() => {
+      const metersPerTan = amountOf(input.metersPerTan)
+      if (metersPerTan <= 0) throw new Error('Tan length must be greater than zero meters per Tan.')
+      const buyPricePerMeter = amountOf(input.buyPricePerMeter)
+      const salePricePerMeter = amountOf(input.salePricePerMeter)
+      return { productType: 'tan', tanType: input.tanType == null ? product.tanType || '' : String(input.tanType).trim(), metersPerTan, buyPricePerMeter, salePricePerMeter }
+    })() : input.productType === 'suit' ? { productType: 'suit', tanType: '', metersPerTan: undefined, buyPricePerMeter: undefined, salePricePerMeter: undefined } : product.productType === 'tan' && Number(product.metersPerTan) > 0 ? { salePricePerMeter: Number(salePrice || 0) / Number(product.metersPerTan), buyPricePerMeter: Number(averageCost || 0) / Number(product.metersPerTan) } : {}),
     labels: input.labels == null ? product.labels || [] : input.labels,
     active: input.active == null ? product.active : Boolean(input.active),
     size: input.size == null ? product.size : String(input.size).trim(),
