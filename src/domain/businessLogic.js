@@ -2066,7 +2066,7 @@ export function updateProductDetails(database, input) {
   if (!product) throw new Error('Product could not be found.')
   if (input.expectedProductToken != null && input.expectedProductToken !== productEditToken(product)) throw new Error('Stock changed while you were editing. Close and reopen the editor.')
   if (input.expectedStockQuantity != null && Number(input.expectedStockQuantity) !== Number(product.stockQuantity || 0)) throw new Error('Stock changed while you were editing. Refresh and try again.')
-  if (input.active === false && (Number(product.stockQuantity || 0) > 0 || Number(product.reservedQuantity || 0) > 0 || Number(product.defectiveQuantity || 0) > 0)) throw new Error('Remove or resolve all stock, reservations and defective units before deleting this product.')
+  if (input.active === false && (Number(product.reservedQuantity || 0) > 0 || Number(product.defectiveQuantity || 0) > 0)) throw new Error('Resolve held reservations and defective or quarantined units before archiving this product.')
   if (input.name != null && !String(input.name).trim()) throw new Error('Product name is required.')
   const salePrice = input.salePrice == null ? product.salePrice : amountOf(input.salePrice)
   const averageCost = input.averageCost == null ? product.averageCost : amountOf(input.averageCost)
