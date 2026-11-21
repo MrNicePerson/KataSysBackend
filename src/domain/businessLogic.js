@@ -199,6 +199,9 @@ export function createSale(database, input, { actor = null } = {}) {
       if (typeof item.name !== 'string' || typeof item.code !== 'string' || !name || !code) throw new Error('Old returns require an item name / brand and article code.')
       const supplier = database.suppliers.find((entry) => entry.id === item.supplierId && entry.active !== false)
       if (!supplier) throw new Error('Choose a valid active supplier for the old return.')
+      const supplierCode = String(supplier.supplierCode || '').trim().toUpperCase()
+      if (!supplierCode) throw new Error('Add a supplier code before recording an old return.')
+      const batchNumber = `${supplierCode}000000`
       if (!['sellable', 'replace', 'damaged'].includes(item.returnCondition)) throw new Error('Choose Return, Replace or Defective.')
       if (!['number', 'string'].includes(typeof item.quantity) || !String(item.quantity).trim()) throw new Error('Quantity must be a positive whole number.')
       const quantity = positiveQuantity(item.quantity)
@@ -210,7 +213,7 @@ export function createSale(database, input, { actor = null } = {}) {
       const product = record('product', { name, code, articleNumber: code, supplierId: supplier.id, supplier: supplier.name,
         productType: 'suit', stockQuantity: 0, defectiveQuantity: 0, reservedQuantity: 0,
         averageCost: purchaseCost, salePrice: amountOf(item.returnValue), active: true,
-        sourceType: 'old-customer-return', batchNumber: makeId('OLD-RETURN') })
+        sourceType: 'old-customer-return', batchNumber, supplierCode })
       if (!Number.isSafeInteger(Math.round(quantity * Number(item.returnValue) * 100)) || !Number.isSafeInteger(Math.round(quantity * purchaseCost * 100))) throw new Error('Return amount or valuation is too large.')
       return { oldItemReturn: true, product, reason: String(item.reason || '').trim(),
         originalSale: { id: null, number: '', customerId: input.customerId || null, customer: input.customer || '' },
