@@ -268,8 +268,8 @@ export async function deliverDueNotifications(now = new Date()) {
     { $set: { archivedAt: now } },
   )
   const promises = paymentPromiseStates(database)
-  const activePromiseIds = promises.filter((promise) => promise.status === 'scheduled').map((promise) => promise.id)
-  await Notification.updateMany({ relatedType: 'payment-promise', relatedId: { $nin: activePromiseIds }, archivedAt: null }, { $set: { archivedAt: now } })
+  const activePromiseEvents = promises.filter((promise) => promise.status === 'scheduled').map((promise) => `payment-promise:${promise.id}:${promise.dueDate}`)
+  await Notification.updateMany({ relatedType: 'payment-promise', eventKey: { $nin: activePromiseEvents }, archivedAt: null }, { $set: { archivedAt: now } })
   const promiseNotifications = promises.filter((promise) => promise.status === 'scheduled').flatMap((promise) => users.filter((user) => hasPermission(user, 'notifications', 'view') && hasPermission(user, 'customers', 'view')).map((user) => ({
     updateOne: {
       filter: { recipientId: String(user._id), eventKey: `payment-promise:${promise.id}:${promise.dueDate}` },

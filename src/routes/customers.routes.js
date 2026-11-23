@@ -45,5 +45,6 @@ customersRouter.post('/:id/payments', mutate('account-payment', { input: (req) =
 customersRouter.post('/:id/adjustments', requirePermission('customers', 'edit'), mutate('customer-balance-adjustment', { input: (req) => ({ ...req.body, customerId: req.params.id }) }))
 customersRouter.patch('/:id', mutate('update-account', { status: 200, input: (req) => ({ ...req.body, accountType: 'customer', accountId: req.params.id }) }))
 customersRouter.post('/recovery/bulk', mutate('bulk-recovery'))
+customersRouter.patch('/payment-promises/:saleId', requirePermission('customers', 'edit'), mutate('update-payment-promises', { status: 200, input: (req) => ({ ...req.body, saleId: req.params.saleId }) }))
 customersRouter.post('/installments', mutate('create-installment'))
 customersRouter.post('/installments/:id/payments', mutate('installment-payment', { input: (req) => ({ ...req.body, installmentId: req.params.id }) }))

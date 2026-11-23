@@ -1,5 +1,5 @@
 import { productEditToken, purchaseEditToken } from './stockEditToken.js'
-import { validatePaymentPromises } from './paymentPromises.js'
+import { paymentPromiseStates, validatePaymentPromises } from './paymentPromises.js'
 import { requireDate, returnRefundAmount, validateBackupNumbers } from './inputValidation.js'
 import { nextReceivingBatch, receivingLabel } from './receiving.js'
 
@@ -1189,6 +1189,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'customer-return': return processCustomerReturn(database, input)
     case 'supplier-return': return processSupplierReturn(database, input)
     case 'account-payment': return recordAccountPayment(database, input)
+    case 'update-payment-promises': return updatePaymentPromises(database, input)
     case 'customer-balance-adjustment': return recordCustomerBalanceAdjustment(database, input)
     case 'expense': return recordExpense(database, input)
     case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status, { actor: context.actor, remarks: input.remarks, bounceDate: input.bounceDate, bounceReason: input.bounceReason, bankCharges: input.bankCharges })
@@ -1344,6 +1345,50 @@ export function recordAccountPayment(database, input) {
   if (chequeAmount > 0) next = { ...next, cheques: [...chequeEntries.map((entry) => record('cheque', { direction: isCustomer ? 'received' : 'given', partyType: input.accountType, partyId: account.id, party: account.name, ...entry, note: input.note || '', referenceId: payment.id, status: 'Pending' })), ...next.cheques] }
   next = { ...next, auditHistory: addAudit(next, payment.type, payment.id, `${input.accountType} payment recorded`) }
   return { database: next, record: payment }
+}
+
+export function updatePaymentPromises(database, input) {
+  const sale = database.sales.find((entry) => entry.id === input.saleId)
+  if (!sale) throw new Error('The sale linked to this promise could not be found.')
+  if (!sale.customerId) throw new Error('Payment promises need a saved customer account.')
+  const customer = database.customers.find((entry) => entry.id === sale.customerId && entry.active !== false)
+  if (!customer) throw new Error('The customer account linked to this sale is no longer active.')
+  if (!Array.isArray(input.paymentPromises)) throw new Error('Payment promises must be sent as a list.')
+
+  const existing = new Map((sale.paymentPromises || []).map((promise) => [promise.id, promise]))
+  const states = paymentPromiseStates(database)
+  const stateById = new Map(states.map((promise) => [promise.id, promise]))
+  const requested = input.paymentPromises.map((row, index) => {
+    const id = row.id ? String(row.id) : makeId('promise')
+    if (row.id && !existing.has(id)) throw new Error('A payment promise does not belong to this sale.')
+    const dueDate = String(row.dueDate || '').trim()
+    const remaining = Number(row.amount)
+    const parsedDate = new Date(`${dueDate}T00:00:00Z`)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || !Number.isFinite(parsedDate.getTime()) || parsedDate.toISOString().slice(0, 10) !== dueDate) throw new Error(`Promise ${index + 1}: enter a valid due date.`)
+    if (!Number.isFinite(remaining) || remaining < 0 || (!row.id && remaining <= 0)) throw new Error(`Promise ${index + 1}: enter a valid remaining amount.`)
+    const old = existing.get(id)
+    const paid = old ? Math.max(0, Number(old.amount || 0) - Number(stateById.get(id)?.remaining ?? old.amount ?? 0)) : 0
+    return { ...(old || {}), id, customerId: sale.customerId, dueDate, amount: money(paid + remaining), status: old?.status === 'cancelled' ? 'cancelled' : 'scheduled' }
+  })
+
+  const otherPromisesDue = states
+    .filter((promise) => promise.customerId === customer.id && promise.saleId !== sale.id && promise.status === 'scheduled')
+    .reduce((sum, promise) => sum + Number(promise.remaining || 0), 0)
+  const requestedDue = requested.reduce((sum, promise) => {
+    if (promise.status === 'cancelled') return sum
+    const old = existing.get(promise.id)
+    const paid = old ? Math.max(0, Number(old.amount || 0) - Number(stateById.get(promise.id)?.remaining ?? old.amount ?? 0)) : 0
+    return sum + Math.max(0, Number(promise.amount || 0) - paid)
+  }, 0)
+  if (otherPromisesDue + requestedDue > Math.max(0, Number(customer.balance || 0)) + 0.005) throw new Error('Payment promises cannot exceed the customer’s current outstanding balance.')
+
+  const updatedSale = { ...sale, paymentPromises: requested }
+  const next = {
+    ...database,
+    sales: database.sales.map((entry) => entry.id === sale.id ? updatedSale : entry),
+    auditHistory: addAudit(database, 'payment-promise-update', sale.id, `Payment promises updated for sale ${sale.number || sale.id}`),
+  }
+  return { database: next, record: updatedSale }
 }
 
 export function recordCustomerBalanceAdjustment(database, input) {
