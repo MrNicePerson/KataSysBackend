@@ -1192,7 +1192,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'update-payment-promises': return updatePaymentPromises(database, input)
     case 'customer-balance-adjustment': return recordCustomerBalanceAdjustment(database, input)
     case 'expense': return recordExpense(database, input)
-    case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status, { actor: context.actor, remarks: input.remarks, bounceDate: input.bounceDate, bounceReason: input.bounceReason, bankCharges: input.bankCharges })
+    case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status, { ...input, actor: context.actor })
     case 'cheque-details': return updateChequeDetails(database, input, context.actor)
     case 'delete-cheque': return deletePendingCheque(database, input.chequeId, context.actor)
     case 'hold-order': return recordHeldOrder(database, input)
@@ -1440,7 +1440,7 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
   const cheque = database.cheques.find((entry) => entry.id === chequeId)
   if (!cheque) throw new Error('Cheque could not be found.')
   if (options.bankCharges != null) amountOf(options.bankCharges)
-  if (cheque.status === status) return { database, record: cheque }
+  if (cheque.status === status && status !== 'Paid by other method') return { database, record: cheque }
   const previousStatus = cheque.status || 'Pending'
   const pendingStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled']
   const bounced = ['Returned', 'Bounced', 'Bounced / Dishonoured'].includes(status)
@@ -1451,6 +1451,14 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
   if (status === 'Cleared' && !pendingStatuses.includes(previousStatus)) throw new Error(`Cannot clear a ${previousStatus.toLowerCase()} cheque.`)
   if (bounced && !pendingStatuses.includes(previousStatus) && previousStatus !== 'Cleared') throw new Error(`Cannot bounce a ${previousStatus.toLowerCase()} cheque.`)
   const timestamp = now()
+  const isOutsidePayment = status === 'Paid by other method'
+  const previousOutsidePaid = Number(cheque.paidOutsideChequeAmount || 0)
+  const outsidePaymentAmount = isOutsidePayment ? money(amountOf(options.settlementAmount)) : 0
+  const remainingBeforePayment = Math.max(0, money(Number(cheque.amount || 0) - previousOutsidePaid))
+  if (isOutsidePayment && (!outsidePaymentAmount || outsidePaymentAmount > remainingBeforePayment + 0.005)) throw new Error(`Payment must be greater than zero and no more than the remaining ${remainingBeforePayment.toLocaleString()} amount.`)
+  const outsidePaidAmount = money(previousOutsidePaid + outsidePaymentAmount)
+  const isFullySettledOutside = isOutsidePayment && outsidePaidAmount >= Number(cheque.amount || 0) - 0.005
+  const nextStatus = isOutsidePayment && !isFullySettledOutside ? previousStatus : status
   const historyEntry = {
     previousStatus,
     status,
@@ -1461,11 +1469,15 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
   }
   const updated = {
     ...cheque,
-    status,
-    statusHistory: [...(cheque.statusHistory || []), historyEntry],
+    status: nextStatus,
+    statusHistory: [...(cheque.statusHistory || []), { ...historyEntry, status: isOutsidePayment && !isFullySettledOutside ? 'Partial payment recorded' : status }],
+    ...(isOutsidePayment ? {
+      paidOutsideChequeAmount: outsidePaidAmount,
+      outsideChequePayments: [...(cheque.outsideChequePayments || []), { amount: outsidePaymentAmount, method: options.paymentMethod, date: dateOf(options.paymentDate), note: String(options.remarks || '').trim(), ...(options.bankDetails ? { bankDetails: options.bankDetails } : {}), recordedAt: timestamp }],
+    } : {}),
     ...(status === 'Cleared' ? { clearedAt: timestamp, actualClearanceDate: dateOf() } : {}),
     ...(status === 'Cancelled' ? { cancelledAt: timestamp } : {}),
-    ...(status === 'Paid by other method' ? { settledAt: timestamp, settledByMethod: options.paymentMethod } : {}),
+    ...(isFullySettledOutside ? { settledAt: timestamp, settledByMethod: options.paymentMethod } : {}),
     ...(bounced ? {
       bounceDate: options.bounceDate || dateOf(),
       bounceReason: String(options.bounceReason || options.remarks || '').trim(),
@@ -1473,9 +1485,9 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
     } : {}),
   }
   let next = { ...database, cheques: database.cheques.map((entry) => entry.id === chequeId ? updated : entry) }
-  if (status === 'Paid by other method') {
+  if (isOutsidePayment) {
     const paymentDate = dateOf(options.paymentDate)
-    const amount = money(amountOf(cheque.amount))
+    const amount = outsidePaymentAmount
     const isCustomer = cheque.partyType === 'customer'
     const accountRows = isCustomer ? next.customers : next.suppliers
     const account = accountRows.find((entry) => entry.id === cheque.partyId && entry.active !== false)
@@ -1502,23 +1514,26 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
       : null
     if (bankDetails?.bankAccountId && !bankAccount) throw new Error('Choose an active bank account.')
     const payment = { type: isCustomer ? 'customer-payment' : 'supplier-payment', method: options.paymentMethod, amount, ...(bankDetails ? { bankDetails: { bankName: String(bankDetails.bankName).trim(), accountNumber: String(bankDetails.accountNumber || '').trim(), ...(bankAccount ? { bankAccountId: bankAccount.id } : {}) } } : {}), customerId: isCustomer ? cheque.partyId : undefined, supplierId: isCustomer ? undefined : cheque.partyId, referenceId: cheque.id, date: paymentDate, note: String(options.remarks || `Cheque ${cheque.number || cheque.id} settled outside cheque`).trim() }
-    next = { ...next, payments: addPayment(next, payment), cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: true } : entry) }
+    next = { ...next, payments: addPayment(next, payment) }
     if (options.paymentMethod === 'bank' && bankAccount) {
       const transaction = record('bank-transaction', { type: isCustomer ? 'deposit' : 'withdrawal', accountId: bankAccount.id, destinationAccountId: '', source: 'bank', destination: isCustomer ? 'bank' : 'external', amount, date: paymentDate, reference: cheque.id, note: `Cheque ${cheque.number || cheque.id} settled by bank payment` })
       next = { ...next, bankTransactions: [transaction, ...(next.bankTransactions || [])] }
     }
   }
   if (status === 'Cleared' && !cheque.appliedToBalance) {
-    if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, -Number(cheque.amount || 0)) }
-    if (cheque.partyType === 'supplier' && cheque.partyId) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, -Number(cheque.amount || 0)) }
-    next = { ...next, cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: true } : entry), payments: addPayment(next, { type: cheque.partyType === 'customer' ? 'customer-payment' : 'supplier-payment', method: 'cheque-cleared', amount: cheque.amount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf(), note: cheque.note || '' }) }
+    const clearedAmount = Math.max(0, money(Number(cheque.amount || 0) - Number(cheque.paidOutsideChequeAmount || 0)))
+    if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, -clearedAmount) }
+    if (cheque.partyType === 'supplier' && cheque.partyId) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, -clearedAmount) }
+    next = { ...next, cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: true, clearedByChequeAmount: clearedAmount } : entry), payments: clearedAmount ? addPayment(next, { type: cheque.partyType === 'customer' ? 'customer-payment' : 'supplier-payment', method: 'cheque-cleared', amount: clearedAmount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf(), note: cheque.note || '' }) : next.payments }
   }
-  if (bounced && cheque.status === 'Cleared' && cheque.appliedToBalance) {
-    if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, Number(cheque.amount || 0)) }
-    if (cheque.partyType === 'supplier' && cheque.partyId) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, Number(cheque.amount || 0)) }
-    next = { ...next, cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: false } : entry), payments: addPayment(next, { type: 'cheque-reversal', method: 'cheque-returned', amount: cheque.amount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf() }) }
+  if (bounced && cheque.appliedToBalance && (cheque.status === 'Cleared' || cheque.sourceType === 'purchase')) {
+    const reversalAmount = cheque.sourceType === 'purchase' ? Math.max(0, Number(cheque.amount || 0) - Number(cheque.paidOutsideChequeAmount || 0)) : Number(cheque.clearedByChequeAmount ?? Math.max(0, Number(cheque.amount || 0) - Number(cheque.paidOutsideChequeAmount || 0)))
+    if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, reversalAmount) }
+    if (cheque.partyType === 'supplier' && cheque.partyId) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, reversalAmount) }
+    next = { ...next, cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: false } : entry), payments: reversalAmount ? addPayment(next, { type: 'cheque-reversal', method: 'cheque-returned', amount: reversalAmount, customerId: cheque.partyType === 'customer' ? cheque.partyId : undefined, supplierId: cheque.partyType === 'supplier' ? cheque.partyId : undefined, referenceId: cheque.referenceId, date: dateOf() }) : next.payments }
   }
-  const auditHistory = [...next.auditHistory, record('audit', { type: 'cheque-status', referenceId: cheque.id, description: `Cheque marked ${status.toLowerCase()}${historyEntry.remarks ? `: ${historyEntry.remarks}` : ''}`, date: timestamp, userId: historyEntry.userId, userName: historyEntry.userName })]
+  const auditDescription = isOutsidePayment ? `${isFullySettledOutside ? 'Cheque fully settled' : 'Partial cheque payment recorded'} · Rs. ${outsidePaymentAmount.toLocaleString()} by ${options.paymentMethod}` : `Cheque marked ${status.toLowerCase()}`
+  const auditHistory = [...next.auditHistory, record('audit', { type: 'cheque-status', referenceId: cheque.id, description: `${auditDescription}${historyEntry.remarks ? `: ${historyEntry.remarks}` : ''}`, date: timestamp, userId: historyEntry.userId, userName: historyEntry.userName })]
   next = { ...next, auditHistory }
   return { database: next, record: next.cheques.find((entry) => entry.id === chequeId) }
 }
