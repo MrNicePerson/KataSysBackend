@@ -35,6 +35,7 @@ chequesRouter.get('/', (req, res) => {
 
 chequesRouter.post('/', mutate('create-cheque'))
 chequesRouter.post('/:id/replace', mutate('replace-cheque', { status: 200, input: (req) => ({ ...req.body, chequeId: req.params.id }) }))
+chequesRouter.post('/:id/settle-and-replace', mutate('settle-and-replace-cheque', { status: 200, input: (req) => ({ ...req.body, chequeId: req.params.id }) }))
 chequesRouter.patch('/:id/status', mutate('cheque-status', { status: 200, input: (req) => ({ ...req.body, chequeId: req.params.id }) }))
 chequesRouter.patch('/:id/details', mutate('cheque-details', { status: 200, input: (req) => ({ ...req.body, chequeId: req.params.id }) }))
 chequesRouter.delete('/:id', mutate('delete-cheque', { status: 200, input: (req) => ({ chequeId: req.params.id }) }))

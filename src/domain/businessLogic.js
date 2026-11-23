@@ -1194,6 +1194,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'expense': return recordExpense(database, input)
     case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status, { ...input, actor: context.actor })
     case 'replace-cheque': return replaceCheque(database, input, context.actor)
+    case 'settle-and-replace-cheque': return settleAndReplaceCheque(database, input, context.actor)
     case 'cheque-details': return updateChequeDetails(database, input, context.actor)
     case 'delete-cheque': return deletePendingCheque(database, input.chequeId, context.actor)
     case 'hold-order': return recordHeldOrder(database, input)
@@ -2073,6 +2074,13 @@ export function replaceCheque(database, input, actor = null) {
   ]
   const next = { ...database, cheques: [replacement, ...database.cheques.map((entry) => entry.id === cheque.id ? cancelled : entry)], auditHistory }
   return { database: next, record: { ...replacement, replacedChequeId: cheque.id } }
+}
+
+export function settleAndReplaceCheque(database, input, actor = null) {
+  if (!input.replacementCheque || typeof input.replacementCheque !== 'object') throw new Error('Enter details for the replacement cheque.')
+  const settled = updateChequeStatus(database, input.chequeId, 'Paid by other method', { ...input, actor })
+  if (settled.record.status === 'Paid by other method') throw new Error('A replacement cheque needs a remaining balance. Enter a smaller payment amount.')
+  return replaceCheque(settled.database, { ...input.replacementCheque, chequeId: input.chequeId }, actor)
 }
 
 export function completeHeldOrder(database, input) {
