@@ -2461,7 +2461,8 @@ export function updateSaleBill(database, input) {
   for (const [productId, quantity] of newByProduct) {
     const product = database.products.find((entry) => entry.id === productId)
     if (!product) throw new Error('A bill product could not be found.')
-    if (Number(product.stockQuantity || 0) + (oldByProduct.get(productId) || 0) - Number(product.reservedQuantity || 0) < quantity) throw new Error(`Not enough available stock for ${product.name}.`)
+    const additionalQuantity = quantity - (oldByProduct.get(productId) || 0)
+    if (additionalQuantity > 0 && Number(product.stockQuantity || 0) - Number(product.reservedQuantity || 0) < additionalQuantity) throw new Error(`Not enough available stock for ${product.name}.`)
   }
   const products = database.products.map((product) => ({ ...product, stockQuantity: Number(product.stockQuantity || 0) + (oldByProduct.get(product.id) || 0) - (newByProduct.get(product.id) || 0) }))
   const updated = {
