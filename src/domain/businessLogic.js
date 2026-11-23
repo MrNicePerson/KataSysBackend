@@ -1046,7 +1046,7 @@ export function recordStockCountAudit(database, input) {
 }
 
 export function assertDueCustomerChequesUpdated(database, date) {
-  const finalStatuses = new Set(['Cleared', 'Returned', 'Cancelled', 'Bounced', 'Bounced / Dishonoured', 'Replaced'])
+  const finalStatuses = new Set(['Cleared', 'Paid by other method', 'Returned', 'Cancelled', 'Bounced', 'Bounced / Dishonoured', 'Replaced'])
   const due = (database.cheques || []).filter(cheque => cheque.direction === 'received'
     && cheque.partyType !== 'supplier'
     && String(cheque.expectedClearanceDate || cheque.dueDate || '').slice(0, 10) === date
@@ -1435,7 +1435,7 @@ export function recordExpense(database, input) {
 }
 
 export function updateChequeStatus(database, chequeId, status, options = {}) {
-  const allowedStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Cleared', 'Returned', 'Cancelled', 'Bounced', 'Bounced / Dishonoured', 'Rescheduled', 'Replaced']
+  const allowedStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Cleared', 'Returned', 'Cancelled', 'Bounced', 'Bounced / Dishonoured', 'Rescheduled', 'Replaced', 'Paid by other method']
   if (!allowedStatuses.includes(status)) throw new Error('Choose a valid cheque transaction status.')
   const cheque = database.cheques.find((entry) => entry.id === chequeId)
   if (!cheque) throw new Error('Cheque could not be found.')
@@ -1444,6 +1444,9 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
   const previousStatus = cheque.status || 'Pending'
   const pendingStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled']
   const bounced = ['Returned', 'Bounced', 'Bounced / Dishonoured'].includes(status)
+  if (status === 'Paid by other method' && !pendingStatuses.includes(previousStatus)) throw new Error('Only an unresolved cheque can be settled by another payment method.')
+  if (status === 'Paid by other method' && (!['customer', 'supplier'].includes(cheque.partyType) || !cheque.partyId)) throw new Error('This cheque is missing its customer or supplier account link.')
+  if (status === 'Paid by other method' && !['cash', 'bank'].includes(options.paymentMethod)) throw new Error('Choose cash or bank as the payment method.')
   if (status === 'Cancelled' && !pendingStatuses.includes(previousStatus)) throw new Error('Only unresolved cheques can be cancelled.')
   if (status === 'Cleared' && !pendingStatuses.includes(previousStatus)) throw new Error(`Cannot clear a ${previousStatus.toLowerCase()} cheque.`)
   if (bounced && !pendingStatuses.includes(previousStatus) && previousStatus !== 'Cleared') throw new Error(`Cannot bounce a ${previousStatus.toLowerCase()} cheque.`)
@@ -1462,6 +1465,7 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
     statusHistory: [...(cheque.statusHistory || []), historyEntry],
     ...(status === 'Cleared' ? { clearedAt: timestamp, actualClearanceDate: dateOf() } : {}),
     ...(status === 'Cancelled' ? { cancelledAt: timestamp } : {}),
+    ...(status === 'Paid by other method' ? { settledAt: timestamp, settledByMethod: options.paymentMethod } : {}),
     ...(bounced ? {
       bounceDate: options.bounceDate || dateOf(),
       bounceReason: String(options.bounceReason || options.remarks || '').trim(),
@@ -1469,6 +1473,41 @@ export function updateChequeStatus(database, chequeId, status, options = {}) {
     } : {}),
   }
   let next = { ...database, cheques: database.cheques.map((entry) => entry.id === chequeId ? updated : entry) }
+  if (status === 'Paid by other method') {
+    const paymentDate = dateOf(options.paymentDate)
+    const amount = money(amountOf(cheque.amount))
+    const isCustomer = cheque.partyType === 'customer'
+    const accountRows = isCustomer ? next.customers : next.suppliers
+    const account = accountRows.find((entry) => entry.id === cheque.partyId && entry.active !== false)
+    if (!account) throw new Error('The linked customer or supplier account could not be found.')
+    if (!cheque.appliedToBalance) next = { ...next, [isCustomer ? 'customers' : 'suppliers']: updateBalance(accountRows, account.id, -amount) }
+    if (!isCustomer && cheque.appliedToBalance) {
+      let remaining = amount
+      const payments = []
+      for (const payment of next.payments) {
+        if (remaining > 0 && payment.type === 'supplier-payment' && payment.method === 'cheque' && payment.referenceId === cheque.referenceId) {
+          const applied = Math.min(remaining, Number(payment.amount || 0))
+          remaining -= applied
+          const rest = money(Number(payment.amount || 0) - applied)
+          if (rest > 0) payments.push({ ...payment, amount: rest })
+        } else payments.push(payment)
+      }
+      if (cheque.sourceType === 'purchase' && remaining > 0.005) throw new Error('The original supplier cheque payment could not be reconciled safely. No khata changes were saved.')
+      next = { ...next, payments }
+    }
+    const bankDetails = options.bankDetails || null
+    if (options.paymentMethod === 'bank' && !String(bankDetails?.bankName || '').trim()) throw new Error('Enter the bank name for the bank payment.')
+    const bankAccount = options.paymentMethod === 'bank' && bankDetails?.bankAccountId
+      ? (next.bankAccounts || []).find((entry) => entry.id === bankDetails.bankAccountId && entry.active !== false)
+      : null
+    if (bankDetails?.bankAccountId && !bankAccount) throw new Error('Choose an active bank account.')
+    const payment = { type: isCustomer ? 'customer-payment' : 'supplier-payment', method: options.paymentMethod, amount, ...(bankDetails ? { bankDetails: { bankName: String(bankDetails.bankName).trim(), accountNumber: String(bankDetails.accountNumber || '').trim(), ...(bankAccount ? { bankAccountId: bankAccount.id } : {}) } } : {}), customerId: isCustomer ? cheque.partyId : undefined, supplierId: isCustomer ? undefined : cheque.partyId, referenceId: cheque.id, date: paymentDate, note: String(options.remarks || `Cheque ${cheque.number || cheque.id} settled outside cheque`).trim() }
+    next = { ...next, payments: addPayment(next, payment), cheques: next.cheques.map((entry) => entry.id === chequeId ? { ...entry, appliedToBalance: true } : entry) }
+    if (options.paymentMethod === 'bank' && bankAccount) {
+      const transaction = record('bank-transaction', { type: isCustomer ? 'deposit' : 'withdrawal', accountId: bankAccount.id, destinationAccountId: '', source: 'bank', destination: isCustomer ? 'bank' : 'external', amount, date: paymentDate, reference: cheque.id, note: `Cheque ${cheque.number || cheque.id} settled by bank payment` })
+      next = { ...next, bankTransactions: [transaction, ...(next.bankTransactions || [])] }
+    }
+  }
   if (status === 'Cleared' && !cheque.appliedToBalance) {
     if (cheque.partyType === 'customer' && cheque.partyId) next = { ...next, customers: updateBalance(next.customers, cheque.partyId, -Number(cheque.amount || 0)) }
     if (cheque.partyType === 'supplier' && cheque.partyId) next = { ...next, suppliers: updateBalance(next.suppliers, cheque.partyId, -Number(cheque.amount || 0)) }
