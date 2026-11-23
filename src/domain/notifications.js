@@ -11,6 +11,7 @@ const events = {
   'account-payment': (record) => ({ title: `${record.type === 'supplier-payment' ? 'Supplier' : 'Customer'} payment recorded`, message: `Rs. ${Number(record.amount || 0).toLocaleString()} · ${record.method || 'cash'}`, category: 'payments', permission: record.type === 'supplier-payment' ? 'suppliers' : 'customers', relatedType: record.accountType === 'supplier' ? 'supplier-payment' : 'payment', relatedId: record.id }),
   'cheque-status': (record) => ({ title: `Cheque ${record.status.toLowerCase()}`, message: `${record.number || record.id} · Rs. ${Number(record.amount || 0).toLocaleString()}`, category: 'cheques', permission: 'cheques', relatedType: 'cheque', relatedId: record.id, priority: ['Bounced', 'Returned'].includes(record.status) ? 'urgent' : 'important' }),
   'create-cheque': (record) => ({ title: 'Cheque recorded', message: `${record.number || record.id} · Rs. ${Number(record.amount || 0).toLocaleString()}`, category: 'cheques', permission: 'cheques', relatedType: 'cheque', relatedId: record.id }),
+  'replace-cheque': (record) => ({ title: 'Cheque replaced', message: `${record.number || record.id} · Rs. ${Number(record.amount || 0).toLocaleString()}`, category: 'cheques', permission: 'cheques', relatedType: 'cheque', relatedId: record.id }),
   'create-product': (record) => ({ title: 'Product added to stock', message: `${record.name || record.code || 'New product'} · ${Number(record.stockQuantity || 0)} units`, category: 'stock', permission: 'stock', relatedType: 'product', relatedId: record.id }),
   'update-product': (record) => ({ title: 'Product details updated', message: `${record.name || record.code || 'Stock item'} was updated.`, category: 'stock', permission: 'stock', relatedType: 'product', relatedId: record.id }),
   'adjust-stock': (record) => ({ title: 'Stock quantity updated', message: `${record.quantity > 0 ? '+' : ''}${record.quantity} units · ${record.reason || 'Stock adjustment'}`, category: 'stock', permission: 'stock', relatedType: 'stock-adjustment', relatedId: record.id }),
@@ -159,6 +160,12 @@ export async function createActivityNotifications(command, record, actor) {
     },
   })), { ordered: false })
   if (command === 'create-cheque') await scheduleChequeReminders(record)
+  if (command === 'replace-cheque') {
+    const updatedAt = new Date()
+    await Notification.updateMany({ relatedType: 'cheque-reminder', relatedId: record.replacedChequeId, deliveredAt: null, archivedAt: null }, { $set: { archivedAt: updatedAt } })
+    await Notification.updateMany({ relatedType: 'cheque-reminder', relatedId: record.replacedChequeId, deliveredAt: { $ne: null }, archivedAt: null }, { $set: { title: 'Cheque replaced', message: `Cheque ${record.number || record.id} replaces this cheque.` } })
+    await scheduleChequeReminders(record)
+  }
   if (command === 'cheque-details') {
     await Notification.updateMany({ relatedType: 'cheque-reminder', relatedId: record.id, deliveredAt: null, archivedAt: null }, { $set: { archivedAt: new Date() } })
     if (['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled'].includes(record.status)) await scheduleChequeReminders(record)

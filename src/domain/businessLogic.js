@@ -1193,6 +1193,7 @@ export function runDatabaseCommand(database, command, input = {}, context = {}) 
     case 'customer-balance-adjustment': return recordCustomerBalanceAdjustment(database, input)
     case 'expense': return recordExpense(database, input)
     case 'cheque-status': return updateChequeStatus(database, input.chequeId, input.status, { ...input, actor: context.actor })
+    case 'replace-cheque': return replaceCheque(database, input, context.actor)
     case 'cheque-details': return updateChequeDetails(database, input, context.actor)
     case 'delete-cheque': return deletePendingCheque(database, input.chequeId, context.actor)
     case 'hold-order': return recordHeldOrder(database, input)
@@ -2009,6 +2010,69 @@ export function updateClaimDetails(database, input) {
   }
   const next = { ...database, claims: database.claims.map((entry) => entry.id === claim.id ? updated : entry), auditHistory: addAudit(database, 'claim-update', claim.id, 'Claim dispatch or credit details updated') }
   return { database: next, record: updated }
+}
+
+export function replaceCheque(database, input, actor = null) {
+  const cheque = database.cheques.find((entry) => entry.id === input.chequeId)
+  if (!cheque) throw new Error('Cheque could not be found.')
+  const pendingStatuses = ['Pending', 'Deposited / Presented', 'Under Clearing', 'Rescheduled']
+  if (!pendingStatuses.includes(cheque.status || 'Pending')) throw new Error('Only an unresolved cheque can be replaced.')
+  const remaining = money(Math.max(0, Number(cheque.amount || 0) - Number(cheque.paidOutsideChequeAmount || 0)))
+  if (remaining <= 0) throw new Error('This cheque has no remaining balance to replace.')
+  const number = String(input.number || '').trim()
+  const bank = String(input.bank || '').trim()
+  const issued = dateOf(input.issued)
+  const expectedClearanceDate = String(input.expectedClearanceDate || '').slice(0, 10)
+  if (!number) throw new Error('Enter the replacement cheque number.')
+  if (!bank) throw new Error('Enter the replacement cheque bank.')
+  requireDate(issued)
+  requireDate(expectedClearanceDate)
+  const accountRows = cheque.partyType === 'supplier' ? database.suppliers : database.customers
+  const account = accountRows.find((entry) => entry.id === cheque.partyId && entry.active !== false)
+  if (!account) throw new Error('The linked customer or supplier account could not be found.')
+  const timestamp = now()
+  const replacement = record('cheque', {
+    direction: cheque.direction,
+    partyType: cheque.partyType,
+    partyId: cheque.partyId,
+    party: account.name,
+    amount: remaining,
+    number,
+    bank,
+    issued,
+    dueDate: expectedClearanceDate,
+    expectedClearanceDate,
+    sourceType: cheque.sourceType || 'manual',
+    referenceId: cheque.referenceId || '',
+    ...(cheque.appliedToBalance ? { appliedToBalance: true } : {}),
+    replacedChequeId: cheque.id,
+    paidOutsideChequeAmount: 0,
+    outsideChequePayments: [],
+    notes: String(input.notes || '').trim(),
+    status: 'Pending',
+    createdById: String(actor?._id || ''),
+    createdByName: actor?.name || '',
+  })
+  const cancelled = {
+    ...cheque,
+    status: 'Cancelled',
+    cancelledAt: timestamp,
+    replacementChequeId: replacement.id,
+    statusHistory: [...(cheque.statusHistory || []), {
+      previousStatus: cheque.status || 'Pending',
+      status: 'Cancelled',
+      date: timestamp,
+      userId: String(actor?._id || ''),
+      userName: actor?.name || '',
+      remarks: `Replaced by cheque ${number}; remaining amount Rs. ${remaining.toLocaleString()}.`,
+    }],
+  }
+  const auditHistory = [
+    ...database.auditHistory,
+    record('audit', { type: 'cheque-replaced', referenceId: cheque.id, description: `Cheque ${cheque.number || cheque.id} cancelled and replaced by ${number} for Rs. ${remaining.toLocaleString()}.`, date: timestamp, userId: String(actor?._id || ''), userName: actor?.name || '' }),
+  ]
+  const next = { ...database, cheques: [replacement, ...database.cheques.map((entry) => entry.id === cheque.id ? cancelled : entry)], auditHistory }
+  return { database: next, record: { ...replacement, replacedChequeId: cheque.id } }
 }
 
 export function completeHeldOrder(database, input) {
