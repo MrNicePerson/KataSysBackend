@@ -144,6 +144,8 @@ export function createSale(database, input, { actor = null } = {}) {
   if (input.items.some((item) => item.oldItemReturn) && !idempotencyKey) throw new Error('An old return requires a submission key.')
   const idempotencyFingerprint = idempotencyKey ? JSON.stringify({
     customerId: input.customerId || null,
+    customer: input.customer || '',
+    walkInCustomerDetails: input.walkInCustomerDetails || null,
     items: input.items.map((item) => ({
       productId: item.productId || null,
       quantity: item.quantity,
@@ -260,20 +262,45 @@ export function createSale(database, input, { actor = null } = {}) {
   if (chequeEntries.some((entry) => !entry.number || !entry.bank || entry.amount <= 0)) throw new Error('Each cheque needs a number, bank and positive amount.')
   if (Math.abs(chequeEntries.reduce((sum, entry) => sum + entry.amount, 0) - split.cheque) > 0.005) throw new Error('Cheque amounts must add up to the cheque payment amount.')
   if (new Set(chequeEntries.map((entry) => `${entry.bank.toLowerCase()}|${entry.number.toLowerCase()}`)).size !== chequeEntries.length) throw new Error('Cheque numbers must be unique within this sale.')
-  if (split.credit > 0 && !input.customerId) throw new Error('Choose a customer before saving a sale with an unpaid balance.')
+  let customerId = input.customerId && input.customerId !== 'walk-in' ? input.customerId : null
+  let customers = database.customers
+  let createdWalkInCustomer = null
+  if (customerId && !customers.some((entry) => entry.id === customerId && entry.active !== false)) throw new Error('Choose an active saved customer.')
+  if (split.credit > 0 && !customerId) {
+    const details = input.walkInCustomerDetails || input.customerDetails || {}
+    const name = String(details.name || input.customer || '').trim()
+    const phone = String(details.phone || input.customerPhone || '').trim()
+    const address = String(details.address || input.customerAddress || '').trim()
+    if (!name || name.toLowerCase() === 'walk-in customer') throw new Error('Enter the walk-in customer name before saving a sale to Khata.')
+    const duplicate = customers.find((entry) => entry.active !== false && String(entry.name || '').trim().toLowerCase() === name.toLowerCase())
+    if (duplicate) {
+      const duplicatePhone = String(duplicate.phone || duplicate.mobile || duplicate.mobileNumber || duplicate.phoneNumber || '').replace(/\D/g, '')
+      if (phone && duplicatePhone && phone.replace(/\D/g, '') === duplicatePhone) customerId = duplicate.id
+      else throw new Error('A customer with this name already exists. Select the saved customer before using Khata.')
+    } else {
+      createdWalkInCustomer = record('customer', { name, phone, address, openingBalance: 0, balance: 0, active: true })
+      customers = [createdWalkInCustomer, ...customers]
+      customerId = createdWalkInCustomer.id
+    }
+  }
+  if (split.credit > 0 && !customerId) throw new Error('Choose or enter a customer before saving a sale to Khata.')
+  for (const item of returnItems) if (item.oldItemReturn) {
+    item.originalSale.customerId = customerId
+    item.originalSale.customer = customers.find((entry) => entry.id === customerId)?.name || String(input.customer || '')
+  }
   const bankDetails = split.bank > 0 ? {
     bankName: String(input.bankDetails?.bankName || '').trim(),
     accountNumber: String(input.bankDetails?.accountNumber || '').trim(),
     amount: split.bank,
   } : null
-  const paymentPromises = validatePaymentPromises(input.paymentPromises, { customerId: input.customerId, customers: database.customers, due: split.credit })
+  const paymentPromises = validatePaymentPromises(input.paymentPromises, { customerId, customers, due: split.credit })
   const sale = record('sale', {
     number: input.number || `INV-${String((database.counters?.sale || 0) + 1).padStart(4, '0')}`,
     date: dateOf(input.date),
     branchId: normalizeBranchId(input.branchId),
-    customerId: input.customerId || null,
-    customer: input.customer || database.customers.find((entry) => entry.id === input.customerId)?.name || '',
-    customerDetails: input.customerDetails || null,
+    customerId,
+    customer: input.customer || customers.find((entry) => entry.id === customerId)?.name || 'Walk-in customer',
+    customerDetails: input.customerDetails || input.walkInCustomerDetails || null,
     customerPhone: input.customerPhone || '',
     customerAddress: input.customerAddress || '',
     padInvoiceNumber: input.padInvoiceNumber || input.paidInvoiceNumber || '',
@@ -291,7 +318,7 @@ export function createSale(database, input, { actor = null } = {}) {
     bankDetails,
     paid: split.cash + split.bank,
     due: split.credit,
-    paymentPromises: paymentPromises.map((promise) => ({ ...promise, id: makeId('promise'), customerId: input.customerId, status: 'scheduled' })),
+    paymentPromises: paymentPromises.map((promise) => ({ ...promise, id: makeId('promise'), customerId, status: 'scheduled' })),
     paymentDue: input.paymentDue || '',
     status: split.credit > 0 ? 'credit' : 'paid',
   })
@@ -345,11 +372,11 @@ export function createSale(database, input, { actor = null } = {}) {
       if (item.oldItemReturn) Object.assign(claim, { sourceType: 'old-customer-return', returnValue: item.amount, inventoryManagedBySource: false, description: item.reason || 'Old customer return' })
     }
   }
-  let customers = database.customers
   if (sale.customerId && (split.credit > 0 || refundType === 'khata' && refundDue > 0)) {
     customers = updateBalance(customers, sale.customerId, split.credit - (refundType === 'khata' ? refundDue : 0))
   }
   let next = { ...database, products, customers, sales: [sale, ...database.sales], returns: [...returnRecords, ...database.returns], claims, stockMovements }
+  if (createdWalkInCustomer) next = { ...next, auditHistory: addAudit(next, 'customer', customerId, `Walk-in customer ${createdWalkInCustomer.name} created for a credit sale`) }
   if (split.cash > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'cash', amount: split.cash, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
   if (refundDue > 0 && refundType === 'cash') next = { ...next, payments: addPayment(next, { type: 'customer-refund', method: 'cash', amount: refundDue, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
   if (split.bank > 0) next = { ...next, payments: addPayment(next, { type: 'customer-payment', method: 'bank', amount: split.bank, bankDetails, customerId: sale.customerId, referenceId: sale.id, date: sale.date }) }
