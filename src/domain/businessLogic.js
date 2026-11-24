@@ -1273,6 +1273,26 @@ export function processCustomerReturn(database, input) {
 }
 
 export function processSupplierReturn(database, input) {
+  if (Array.isArray(input.items)) {
+    if (!input.items.length) throw new Error('Select at least one item for the supplier return.')
+    const returnNumber = nextDocumentNumber(database, 'supplierReturns', 'SRET')
+    let nextDatabase = database
+    const items = []
+    for (const item of input.items) {
+      const result = processSupplierReturnLine(nextDatabase, { ...input, ...item, reason: input.reason || item.reason || '' }, returnNumber)
+      nextDatabase = result.database
+      items.push(result.record)
+    }
+    const totalAmount = items.reduce((sum, item) => sum + Number(item.amount || 0), 0)
+    const summary = { id: items[0].id, returnNumber, supplierId: items[0].supplierId, itemName: `${items.length} items`, quantity: items.reduce((sum, item) => sum + Number(item.quantity || 0), 0), totalAmount, amount: totalAmount, date: items[0].date, reason: input.reason || '', items }
+    return { database: { ...nextDatabase, counters: { ...nextDatabase.counters, supplierReturns: Number(database.counters?.supplierReturns || 0) + 1 } }, record: summary }
+  }
+  const returnNumber = nextDocumentNumber(database, 'supplierReturns', 'SRET')
+  const result = processSupplierReturnLine(database, input, returnNumber)
+  return { database: { ...result.database, counters: { ...result.database.counters, supplierReturns: Number(database.counters?.supplierReturns || 0) + 1 } }, record: result.record }
+}
+
+function processSupplierReturnLine(database, input, returnNumber) {
   const purchase = database.purchases.find((entry) => entry.id === input.purchaseId)
   if (!purchase) throw new Error('Choose the original purchase for this supplier return.')
   const originalItem = input.purchaseItemId ? purchase.items.find((item) => item.lineId === input.purchaseItemId) : purchase.items.find((item) => item.productId === input.productId || item.code === input.code)
@@ -1284,13 +1304,12 @@ export function processSupplierReturn(database, input) {
   if (alreadyReturned + quantity > receivedQuantity) throw new Error('Return quantity exceeds the amount received and not yet returned.')
   const product = database.products.find((entry) => entry.id === originalItem.productId)
   if (!product || Number(product.stockQuantity || 0) - Number(product.reservedQuantity || 0) < quantity) throw new Error('There is not enough unreserved stock to return this item.')
-  const returnNumber = nextDocumentNumber(database, 'supplierReturns', 'SRET')
   const result = record('supplier-return', { returnNumber, purchaseId: purchase.id, purchaseItemId: originalItem.lineId, supplierId: purchase.supplierId, productId: product.id, code: originalItem.code, itemName: originalItem.productName, productType: originalItem.productType || 'suit', tanType: originalItem.tanType || '', batchNumber: originalItem.batchNumber || purchase.batchNumber || '', metersPerTan: originalItem.metersPerTan, buyPricePerMeter: originalItem.buyPricePerMeter, salePricePerMeter: originalItem.salePricePerMeter, quantity, amount: quantity * originalItem.unitCost, date: dateOf(input.date), reason: input.reason || '' })
   const products = database.products.map((entry) => entry.id === product.id ? { ...entry, stockQuantity: Number(entry.stockQuantity) - quantity } : entry)
   const suppliers = updateBalance(database.suppliers, purchase.supplierId, -result.amount)
   result.batchNumber = receivingLabel(purchase)
   const stockMovements = addMovement(database, { productId: product.id, type: 'supplier-return', quantity: -quantity, referenceId: result.id, date: result.date, note: `${result.batchNumber}${input.reason ? ` · ${input.reason}` : ''}` })
-  const next = { ...database, products, suppliers, supplierReturns: [result, ...database.supplierReturns], stockMovements, counters: { ...database.counters, supplierReturns: Number(database.counters?.supplierReturns || 0) + 1 }, auditHistory: addAudit(database, 'supplier-return', result.id, `Return linked to receiving ${result.batchNumber}`) }
+  const next = { ...database, products, suppliers, supplierReturns: [result, ...database.supplierReturns], stockMovements, auditHistory: addAudit(database, 'supplier-return', result.id, `Return linked to receiving ${result.batchNumber}`) }
   return { database: next, record: result }
 }
 
